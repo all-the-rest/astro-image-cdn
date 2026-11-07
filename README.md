@@ -68,11 +68,15 @@ With this option, `astro dev` installs the image service and local asset route, 
 | `widths` | `[256, 640, 828, 1080, 1200, 1920, 2048]` | Requested widths. Values above the source width are omitted. |
 | `formats` | `["avif", "webp"]` | Output encodings generated for every selected width. Supported: `avif`, `webp`, `jpeg`, `png`. |
 | `quality` | `75` | Sharp encoder quality from 1 to 100. |
+| `webpEffort` | `4` | Build-wide Sharp WebP encoder effort, an integer from 0 (fastest) to 6 (slowest). |
+| `avifEffort` | `4` | Build-wide Sharp AVIF encoder effort, an integer from 0 (fastest) to 9 (slowest). |
 | `includeSourceFormat` | `true` | Also generate each supported source-native format. Set `false` for only the formats listed in `formats`. |
 | `includeNativeWidth` | `true` | Also generate the source's native width when it is not already in `widths`. |
 | `autoRotate` | `true` | Apply EXIF orientation before resizing. Set `false` to preserve the source's stored pixel orientation and dimensions. |
 | `concurrency` | `4` | Maximum number of source images processed at once. |
 | `devOnly` | `false` | Install the integration only for `astro dev`; other Astro commands retain their configured image service. |
+
+`webpEffort` and `avifEffort` are build-wide encoder settings available to both `astroImageCdn()` and the standalone `processImages()` API. They apply to every generated output of that format and are not per-image Astro request settings. The defaults match Sharp's defaults (4); omitting either option therefore preserves the existing encoder behavior. Invalid or out-of-range values are rejected before image processing or persistent output/cache changes.
 
 Configured formats are generated alongside the source's native raster format when `includeSourceFormat` is enabled (the default). With it disabled, only `formats` are generated. Astro 7.4's default output for raster images is WebP, independent of the order in `formats`; include `webp` or request a configured format explicitly. If the default or an explicit format is unavailable, the service reports which format needs to be added. `widths` are emitted only when they are no wider than the source. The native width is additionally emitted only when `includeNativeWidth` is enabled; if it is already listed in `widths`, it is naturally generated once. For a requested width between generated sizes, the service selects the next available variant, capped at the source's native width.
 
@@ -86,7 +90,7 @@ Image identity is the project-relative file path; no frontmatter, YAML sidecars,
 
 ## Persistence and cache behavior
 
-- Source bytes, encoder settings, the transform implementation version, and the Sharp/libvips versions are fingerprinted with SHA-256.
+- `sourceHash` is the full lowercase SHA-256 of the original source bytes only; it does not change when transform settings change. A separate transform fingerprint is the SHA-256 of that source identity plus the effective transform policy (widths, formats, quality, encoder effort, orientation/SVG settings), the transform implementation version, and the Sharp/libvips versions.
 - Variant filenames include that fingerprint, width, and format. Each manifest variant stores a SHA-256 digest; warm-cache reuse verifies the digest and rejects symlinks instead of trusting file existence alone.
 - Each manifest is checked against the complete set of variants expected for its source and current options, so empty or partial entries trigger repair rather than a false cache hit.
 - The private cache and manifest are updated atomically and only when their contents change. Concurrent native image requests are deduplicated and batched per event-loop turn; batches are serialized through one writer queue, while the configured concurrency controls processing within each batch. A pre-existing `manifest.json` in `outputDir` is detected, reported in the processing result, and warned about when an Astro-requested image or standalone bulk run processes images; it is never modified. Verify its ownership, then manually move it outside public output or remove it before publishing. A filesystem lock allows only one process to write a given output/cache pair; overlapping processes fail with the lock path instead of racing. If a process is interrupted, verify it has stopped and remove any leftover `.astro-image-cdn.lock` file before retrying; the next run can rebuild missing variants.

@@ -8,6 +8,8 @@ const CACHE_VERSION = 1;
 const TRANSFORM_VERSION = 3;
 const DEFAULT_WIDTHS = [256, 640, 828, 1080, 1200, 1920, 2048];
 const DEFAULT_FORMATS = ["avif", "webp"];
+const DEFAULT_WEBP_EFFORT = 4;
+const DEFAULT_AVIF_EFFORT = 4;
 const SUPPORTED_FORMATS = new Set(["avif", "webp", "jpeg", "png", "svg"]);
 const IMAGE_EXTENSIONS = new Set([
   ".avif", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp",
@@ -110,6 +112,23 @@ function validatePositiveInteger(value, label) {
   }
 }
 
+function validateEffort(value, label, maximum) {
+  if (!Number.isSafeInteger(value)) {
+    throw new TypeError(`${label} must be an integer between 0 and ${maximum}; received ${value}`);
+  }
+  if (value < 0 || value > maximum) {
+    throw new RangeError(`${label} must be between 0 and ${maximum}; received ${value}`);
+  }
+}
+
+export function resolveEncoderEfforts(options) {
+  const webpEffort = options.webpEffort === undefined ? DEFAULT_WEBP_EFFORT : options.webpEffort;
+  const avifEffort = options.avifEffort === undefined ? DEFAULT_AVIF_EFFORT : options.avifEffort;
+  validateEffort(webpEffort, "webpEffort", 6);
+  validateEffort(avifEffort, "avifEffort", 9);
+  return { webpEffort, avifEffort };
+}
+
 function heightMatchesExpected(expected, actual) {
   return Number.isSafeInteger(actual) && Math.abs(actual - expected) <= 1;
 }
@@ -127,6 +146,7 @@ function resolveOptions(options) {
   const widths = [...new Set(options.widths ?? DEFAULT_WIDTHS)].sort((a, b) => a - b);
   const formats = [...new Set((options.formats ?? DEFAULT_FORMATS).map(normalizeFormat))];
   const quality = options.quality ?? 75;
+  const { webpEffort, avifEffort } = resolveEncoderEfforts(options);
   const concurrency = options.concurrency ?? 4;
   const dangerouslyProcessSVG = options.dangerouslyProcessSVG ?? false;
   const includeSourceFormat = options.includeSourceFormat ?? true;
@@ -159,6 +179,8 @@ function resolveOptions(options) {
     widths,
     formats,
     quality,
+    webpEffort,
+    avifEffort,
     concurrency,
     dangerouslyProcessSVG,
     includeSourceFormat,
@@ -280,6 +302,8 @@ function pipelineSettings(options) {
     widths: options.widths,
     formats: options.formats,
     quality: options.quality,
+    webpEffort: options.webpEffort,
+    avifEffort: options.avifEffort,
     transformVersion: TRANSFORM_VERSION,
     sharpVersion: sharp.versions.sharp,
     libvipsVersion: sharp.versions.vips,
@@ -432,18 +456,18 @@ async function ensureVariantDirectory(outputDir, file) {
   return filePath;
 }
 
-async function writeVariant(buffer, filePath, width, format, quality, autoRotate, expectedHeight) {
-  if (format === "svg") {
+async function writeVariant(buffer, filePath, variant, options, expectedHeight) {
+  if (variant.format === "svg") {
     await atomicWrite(filePath, buffer);
-    return { digest: digest(buffer), width, height: expectedHeight };
+    return { digest: digest(buffer), width: variant.width, height: expectedHeight };
   }
   const image = sharp(buffer, { failOn: "none" });
-  if (autoRotate) image.rotate();
-  image.resize({ width, withoutEnlargement: true });
-  if (format === "avif") image.avif({ quality });
-  else if (format === "webp") image.webp({ quality });
-  else if (format === "jpeg") image.jpeg({ quality });
-  else image.png({ quality });
+  if (options.autoRotate) image.rotate();
+  image.resize({ width: variant.width, withoutEnlargement: true });
+  if (variant.format === "avif") image.avif({ quality: options.quality, effort: options.avifEffort });
+  else if (variant.format === "webp") image.webp({ quality: options.quality, effort: options.webpEffort });
+  else if (variant.format === "jpeg") image.jpeg({ quality: options.quality });
+  else image.png({ quality: options.quality });
 
   const { data, info } = await image.toBuffer({ resolveWithObject: true });
   await atomicWrite(filePath, data);
@@ -467,7 +491,7 @@ async function mapConcurrent(items, concurrency, callback) {
 
 async function processImagesFromFiles(rawOptions, requestedFiles) {
   const options = resolveOptions(rawOptions);
-  const { rootDir, sourceDirectories, publicDir, widths, formats, quality, concurrency, dangerouslyProcessSVG, autoRotate } = options;
+  const { rootDir, sourceDirectories, publicDir, concurrency, autoRotate } = options;
   let { outputDir, cacheDir } = options;
   const reportedManifestPath = path.join(cacheDir, "manifest.json");
   const canonicalRoot = await canonicalizePath(rootDir);
@@ -603,7 +627,7 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
         await mapConcurrent(missingVariants, Math.min(concurrency, 4), async (variant) => {
           const targetPath = await ensureVariantDirectory(outputDir, variant.file);
           const expectedVariant = expectedByKey.get(variantKey(variant));
-          const output = await writeVariant(sourceBuffer, targetPath, variant.width, variant.format, quality, autoRotate, expectedVariant.height);
+          const output = await writeVariant(sourceBuffer, targetPath, variant, options, expectedVariant.height);
           if (output.width !== expectedVariant.width || !heightMatchesExpected(expectedVariant.height, output.height)) {
             throw new Error(`Generated ${variant.width}.${variant.format} has unexpected dimensions ${output.width}x${output.height}`);
           }

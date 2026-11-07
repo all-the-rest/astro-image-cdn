@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import path from "node:path";
-import { DEFAULT_IMAGE_FORMATS, DEFAULT_IMAGE_WIDTHS } from "./processor.js";
+import { DEFAULT_IMAGE_FORMATS, DEFAULT_IMAGE_WIDTHS, resolveEncoderEfforts } from "./processor.js";
 import { installDevAssetMiddleware } from "./dev-server.js";
 
 const serviceEntrypoint = fileURLToPath(new URL("./service.js", import.meta.url));
@@ -82,6 +82,7 @@ export default function astroImageCdn(options) {
     throw new TypeError("astroImageCdn requires a baseUrl unless devOnly is true");
   }
   const baseUrl = typeof options.baseUrl === "string" ? normalizeBaseUrl(options.baseUrl) : "";
+  const { webpEffort, avifEffort } = resolveEncoderEfforts(options);
   let projectRoot;
   let outputDir;
   let cacheDir;
@@ -111,6 +112,8 @@ export default function astroImageCdn(options) {
           widths: options.widths ?? DEFAULT_IMAGE_WIDTHS,
           formats: options.formats ?? DEFAULT_IMAGE_FORMATS,
           quality: options.quality ?? 75,
+          webpEffort,
+          avifEffort,
           includeSourceFormat: options.includeSourceFormat ?? true,
           includeNativeWidth: options.includeNativeWidth ?? true,
           autoRotate: options.autoRotate ?? true,

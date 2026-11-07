@@ -13,6 +13,10 @@ interface AstroImageCdnBaseOptions {
   formats?: Array<"avif" | "webp" | "jpeg" | "png">;
   /** Encoder quality from 1 to 100. Defaults to 75. */
   quality?: number;
+  /** WebP encoder effort, integer from 0 (fastest) to 6 (slowest). Defaults to Sharp's default, 4. */
+  webpEffort?: number;
+  /** AVIF encoder effort, integer from 0 (fastest) to 9 (slowest). Defaults to Sharp's default, 4. */
+  avifEffort?: number;
   /** Also generate a supported source-native format. Defaults to true. */
   includeSourceFormat?: boolean;
   /** Also generate the source's native width when it is not configured. Defaults to true. */
