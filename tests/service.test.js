@@ -23,6 +23,19 @@ test("rejects image transforms that the static CDN variants cannot honor", () =>
     /per-image cropping is not supported/,
   );
   assert.throws(
+    () => imageService.validateOptions({ src: image, width: 400, height: 301 }, imageConfig),
+    /per-image cropping is not supported/,
+  );
+  assert.throws(
+    () => imageService.validateOptions({
+      src: { src: "/_astro/thin.jpg", width: 6000, height: 1, format: "jpeg" },
+      width: 1,
+      height: 1,
+      fit: "cover",
+    }, imageConfig),
+    /per-image cropping is not supported/,
+  );
+  assert.throws(
     () => imageService.validateOptions({ src: image, width: 400, background: "#fff" }, imageConfig),
     /background flattening/,
   );
@@ -30,6 +43,20 @@ test("rejects image transforms that the static CDN variants cannot honor", () =>
     () => imageService.validateOptions({ src: image, quality: "mid" }, imageConfig),
     /per-image quality mid \(50\) is not available/,
   );
+});
+
+test("allows Astro's rounded integer dimensions for extreme aspect ratios", () => {
+  const cases = [
+    { src: { src: "/_astro/panorama.jpg", width: 6000, height: 1723, format: "jpeg" }, width: 256.2, height: 74 },
+    { src: { src: "/_astro/banner.jpg", width: 340, height: 48, format: "jpeg" }, width: 256, height: 36 },
+    { src: { src: "/_astro/height-only.jpg", width: 6000, height: 1723, format: "jpeg" }, width: 258, height: 74.2 },
+  ];
+
+  for (const options of cases) {
+    const validated = imageService.validateOptions({ ...options, format: "webp", quality: 75 }, imageConfig);
+    assert.equal(validated.width, Math.round(options.width));
+    assert.equal(validated.height, Math.round(options.height));
+  }
 });
 
 test("allows aspect-preserving native dimensions and the source's output format", () => {

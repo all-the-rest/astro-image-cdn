@@ -326,11 +326,27 @@ function validateStaticTransform(options, config) {
     throw new Error(`astro-image-cdn does not support fit="${options.fit}".`);
   }
 
-  const width = Number(options.width ?? options.src.width);
-  const height = Number(options.height ?? (width * options.src.height / options.src.width));
-  const targetRatio = width / height;
-  const sourceRatio = options.src.width / options.src.height;
-  if (Number.isFinite(targetRatio) && Math.abs(targetRatio - sourceRatio) > 0.005) {
+  const sourceWidth = Number(options.src.width);
+  const sourceHeight = Number(options.src.height);
+  let width = options.width == null ? undefined : Number(options.width);
+  let height = options.height == null ? undefined : Number(options.height);
+  if (width != null && height == null) {
+    height = Math.round(width * sourceHeight / sourceWidth);
+  } else if (height != null && width == null) {
+    width = Math.round(height * sourceWidth / sourceHeight);
+  } else if (width == null && height == null) {
+    width = sourceWidth;
+    height = sourceHeight;
+  }
+
+  width = Math.round(width);
+  height = Math.round(height);
+  const expectedHeight = Math.round(width * sourceHeight / sourceWidth);
+  const expectedWidth = Math.round(height * sourceWidth / sourceHeight);
+  const isAspectPreserving = (Number.isSafeInteger(width) && width > 0)
+    && (Number.isSafeInteger(height) && height > 0)
+    && (height === expectedHeight || width === expectedWidth);
+  if (!isAspectPreserving) {
     throw new Error("astro-image-cdn generates aspect-preserving variants only; per-image cropping is not supported.");
   }
 
