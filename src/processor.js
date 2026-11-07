@@ -19,6 +19,12 @@ function normalizeFormat(format) {
   return format === "jpg" ? "jpeg" : format;
 }
 
+function normalizeVariantFormat(metadata) {
+  return metadata.format === "heif" && metadata.mediaType === "image/avif"
+    ? "avif"
+    : normalizeFormat(metadata.format);
+}
+
 function normalizeRelativePath(value) {
   return value.split(path.sep).join("/");
 }
@@ -102,6 +108,10 @@ function validatePositiveInteger(value, label) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new TypeError(`${label} must contain positive integers; received ${value}`);
   }
+}
+
+function heightMatchesExpected(expected, actual) {
+  return Number.isSafeInteger(actual) && Math.abs(actual - expected) <= 1;
 }
 
 function resolveOptions(options) {
@@ -301,10 +311,10 @@ function expectedVariants(fingerprint, dimensions, sourceFormat, options) {
     })));
 }
 
-async function variantMatches(outputDir, variant) {
-  if (!variant || typeof variant.file !== "string" || !/^[a-f0-9]{64}$/.test(variant.digest ?? "")) return false;
+async function readMatchingVariant(outputDir, variant) {
+  if (!variant || typeof variant.file !== "string" || !/^[a-f0-9]{64}$/.test(variant.digest ?? "")) return undefined;
   const filePath = path.resolve(outputDir, variant.file);
-  if (!isInside(outputDir, filePath) || filePath === outputDir) return false;
+  if (!isInside(outputDir, filePath) || filePath === outputDir) return undefined;
 
   try {
     const relative = path.relative(outputDir, filePath);
@@ -313,20 +323,35 @@ async function variantMatches(outputDir, variant) {
     for (const segment of segments.slice(0, -1)) {
       directory = path.join(directory, segment);
       const directoryInfo = await lstat(directory);
-      if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) return false;
+      if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) return undefined;
     }
     const fileInfo = await lstat(filePath);
-    if (!fileInfo.isFile() || fileInfo.isSymbolicLink()) return false;
-    return digest(await readFile(filePath)) === variant.digest;
+    if (!fileInfo.isFile() || fileInfo.isSymbolicLink()) return undefined;
+    const buffer = await readFile(filePath);
+    return digest(buffer) === variant.digest ? buffer : undefined;
   } catch (error) {
-    if (error.code === "ENOENT" || error.code === "ENOTDIR") return false;
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
     throw error;
   }
 }
 
-async function outputExists(outputDir, variants) {
-  const matches = await Promise.all(variants.map((variant) => variantMatches(outputDir, variant)));
-  return matches.every(Boolean);
+async function variantMatches(outputDir, variant) {
+  return (await readMatchingVariant(outputDir, variant)) !== undefined;
+}
+
+async function verifiedVariantHeight(outputDir, variant, expectedVariant) {
+  const buffer = await readMatchingVariant(outputDir, variant);
+  if (!buffer) return undefined;
+  let metadata;
+  try {
+    metadata = await sharp(buffer, { failOn: "none" }).metadata();
+  } catch {
+    return undefined;
+  }
+  if (normalizeVariantFormat(metadata) !== expectedVariant.format
+    || metadata.width !== expectedVariant.width
+    || !heightMatchesExpected(expectedVariant.height, metadata.height)) return undefined;
+  return metadata.height;
 }
 
 function variantKey(variant) {
@@ -344,8 +369,21 @@ function hasCompleteVariantSet(actual, expected) {
   }
   return expected.every((variant) => {
     const actualVariant = byKey.get(variantKey(variant));
-    return actualVariant?.file === variant.file && actualVariant.height === variant.height;
+    return actualVariant?.file === variant.file && heightMatchesExpected(variant.height, actualVariant.height);
   });
+}
+
+async function verifiedOutputVariants(outputDir, actual, expected) {
+  if (!hasCompleteVariantSet(actual, expected)) return undefined;
+  const actualByKey = new Map(actual.map((variant) => [variantKey(variant), variant]));
+  const verified = [];
+  for (const expectedVariant of expected) {
+    const variant = actualByKey.get(variantKey(expectedVariant));
+    const height = await verifiedVariantHeight(outputDir, variant, expectedVariant);
+    if (height === undefined) return undefined;
+    verified.push({ ...variant, height });
+  }
+  return verified;
 }
 
 function carryForwardVariantDigests(expected, previous) {
@@ -360,8 +398,8 @@ function carryForwardVariantDigests(expected, previous) {
 
   return expected.map((variant) => {
     const previousVariant = previousByKey.get(variantKey(variant));
-    if (previousVariant?.file === variant.file && previousVariant.height === variant.height) {
-      return { ...variant, digest: previousVariant.digest };
+    if (previousVariant?.file === variant.file && heightMatchesExpected(variant.height, previousVariant.height)) {
+      return { ...variant, height: previousVariant.height, digest: previousVariant.digest };
     }
     return variant;
   });
@@ -394,10 +432,10 @@ async function ensureVariantDirectory(outputDir, file) {
   return filePath;
 }
 
-async function writeVariant(buffer, filePath, width, format, quality, autoRotate) {
+async function writeVariant(buffer, filePath, width, format, quality, autoRotate, expectedHeight) {
   if (format === "svg") {
     await atomicWrite(filePath, buffer);
-    return digest(buffer);
+    return { digest: digest(buffer), width, height: expectedHeight };
   }
   const image = sharp(buffer, { failOn: "none" });
   if (autoRotate) image.rotate();
@@ -407,9 +445,9 @@ async function writeVariant(buffer, filePath, width, format, quality, autoRotate
   else if (format === "jpeg") image.jpeg({ quality });
   else image.png({ quality });
 
-  const result = await image.toBuffer();
-  await atomicWrite(filePath, result);
-  return digest(result);
+  const { data, info } = await image.toBuffer({ resolveWithObject: true });
+  await atomicWrite(filePath, data);
+  return { digest: digest(data), width: info.width, height: info.height };
 }
 
 async function mapConcurrent(items, concurrency, callback) {
@@ -538,28 +576,39 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
       const dimensions = await imageMetadata(sourceBuffer, sourcePath, autoRotate);
       const sourceFormat = normalizeFormat(dimensions.format);
       const expected = expectedVariants(fingerprint, dimensions, sourceFormat, options);
+      const expectedByKey = new Map(expected.map((variant) => [variantKey(variant), variant]));
 
-      const isWarm = cacheEntry?.fingerprint === fingerprint
+      const canReuse = cacheEntry?.fingerprint === fingerprint
         && previousEntry?.fingerprint === fingerprint
         && previousEntry.sourceHash === sourceHash
         && previousEntry.width === dimensions.width
         && previousEntry.height === dimensions.height
-        && previousEntry.sourceFormat === dimensions.format
-        && hasCompleteVariantSet(previousEntry.variants, expected)
-        && await outputExists(outputDir, previousEntry.variants);
+        && previousEntry.sourceFormat === dimensions.format;
+      const verifiedVariants = canReuse
+        ? await verifiedOutputVariants(outputDir, previousEntry.variants, expected)
+        : undefined;
+      const isWarm = verifiedVariants !== undefined;
       let variants;
       if (isWarm) {
-        variants = previousEntry.variants;
+        variants = verifiedVariants;
         skipped++;
       } else {
         variants = carryForwardVariantDigests(expected, previousEntry?.variants);
         const missingVariants = [];
         for (const variant of variants) {
-          if (!await variantMatches(outputDir, variant)) missingVariants.push(variant);
+          const height = await verifiedVariantHeight(outputDir, variant, expectedByKey.get(variantKey(variant)));
+          if (height === undefined) missingVariants.push(variant);
+          else variant.height = height;
         }
         await mapConcurrent(missingVariants, Math.min(concurrency, 4), async (variant) => {
           const targetPath = await ensureVariantDirectory(outputDir, variant.file);
-          variant.digest = await writeVariant(sourceBuffer, targetPath, variant.width, variant.format, quality, autoRotate);
+          const expectedVariant = expectedByKey.get(variantKey(variant));
+          const output = await writeVariant(sourceBuffer, targetPath, variant.width, variant.format, quality, autoRotate, expectedVariant.height);
+          if (output.width !== expectedVariant.width || !heightMatchesExpected(expectedVariant.height, output.height)) {
+            throw new Error(`Generated ${variant.width}.${variant.format} has unexpected dimensions ${output.width}x${output.height}`);
+          }
+          variant.height = output.height;
+          variant.digest = output.digest;
         });
         processed++;
       }
@@ -706,16 +755,17 @@ export async function adoptImageVariants(rawOptions, adoption) {
       } catch (error) {
         throw new Error(`Unable to read adopted variant ${inputPath}: ${error.message}`, { cause: error });
       }
-      const actualFormat = normalizeFormat(metadata.format);
-      const actualHeight = Math.max(1, Math.round(expectedVariant.width * dimensions.height / dimensions.width));
-      if (actualFormat !== expectedVariant.format || metadata.width !== expectedVariant.width || metadata.height !== actualHeight) {
+      const actualFormat = normalizeVariantFormat(metadata);
+      const expectedHeight = expectedVariant.height;
+      if (actualFormat !== expectedVariant.format || metadata.width !== expectedVariant.width || !heightMatchesExpected(expectedHeight, metadata.height)) {
         throw new Error(
-          `Adopted variant ${inputPath} does not match expected ${expectedVariant.width}x${actualHeight} ${expectedVariant.format}; ` +
+          `Adopted variant ${inputPath} does not match expected ${expectedVariant.width}x${expectedHeight}±1 ${expectedVariant.format}; ` +
           `received ${metadata.width}x${metadata.height} ${actualFormat}.`,
         );
       }
       validated.push({
         ...expectedVariant,
+        height: metadata.height,
         digest: digest(buffer),
         buffer,
       });

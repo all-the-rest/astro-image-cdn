@@ -162,6 +162,111 @@ test("output options select exact formats and widths and can disable EXIF auto-r
   assert.equal((await sharp(path.join(rootDir, ".imagedist", rotatedEntry.variants[0].file)).metadata()).height, 512);
 });
 
+test("adopts and reuses Sharp's one-pixel height rounding for JPEG resize", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const jpegPath = sourcePath.replace(/\.png$/, ".jpg");
+  await sharp({ create: { width: 2769, height: 4154, channels: 3, background: "#527faa" } }).jpeg({ quality: 90 }).toFile(jpegPath);
+  await rm(sourcePath);
+  const source = await readFile(jpegPath);
+  const sourceHash = createHash("sha256").update(source).digest("hex");
+  const legacyDir = path.join(rootDir, ".legacy-image-variants");
+  await mkdir(legacyDir, { recursive: true });
+  const legacyVariants = [];
+  for (const width of [256, 828]) {
+    const variantPath = path.join(legacyDir, `sample_${width}.webp`);
+    await sharp(source).resize({ width, withoutEnlargement: true }).webp({ quality: 75 }).toFile(variantPath);
+    legacyVariants.push({ path: variantPath, width, format: "webp" });
+  }
+
+  const options = {
+    rootDir,
+    widths: [256, 828],
+    formats: ["webp"],
+    includeSourceFormat: false,
+    includeNativeWidth: false,
+    autoRotate: false,
+  };
+  const adoption = await adoptImageVariants(options, {
+    sourcePath: jpegPath,
+    sourceHash,
+    variants: legacyVariants,
+  });
+
+  assert.equal(adoption.adopted, 2);
+  const packageManifestPath = adoption.manifestPath;
+  const previousManifest = JSON.parse(await readFile(packageManifestPath, "utf8"));
+  const previousEntry = previousManifest.images["src/images/sample.jpg"];
+  for (const variant of previousEntry.variants) {
+    variant.height = Math.round(variant.width * 4154 / 2769);
+  }
+  await writeFile(packageManifestPath, `${JSON.stringify(previousManifest, null, 2)}\n`);
+
+  let entry = JSON.parse(await readFile(packageManifestPath, "utf8")).images["src/images/sample.jpg"];
+  const wideVariant = entry.variants.find(({ width }) => width === 828);
+  const widePath = path.join(rootDir, ".imagedist", wideVariant.file);
+  const wideBytesBeforeRepair = await readFile(widePath);
+  const narrowVariant = entry.variants.find(({ width }) => width === 256);
+  await rm(path.join(rootDir, ".imagedist", narrowVariant.file));
+  const partialRepair = await processImages(options);
+  assert.equal(partialRepair.processed, 1);
+  entry = JSON.parse(await readFile(packageManifestPath, "utf8")).images["src/images/sample.jpg"];
+  assert.deepEqual(entry.variants.map(({ width, height }) => [width, height]), [[256, 384], [828, 1243]]);
+  assert.deepEqual(await readFile(widePath), wideBytesBeforeRepair, "valid adopted variants remain untouched during partial repair");
+
+  const staleVariantManifest = JSON.parse(await readFile(packageManifestPath, "utf8"));
+  const staleEntry = staleVariantManifest.images["src/images/sample.jpg"];
+  const staleWideVariant = staleEntry.variants.find(({ width }) => width === 828);
+  const invalidTwoPixelOutput = await sharp({
+    create: { width: 828, height: 1244, channels: 3, background: "#527faa" },
+  }).webp({ quality: 75 }).toBuffer();
+  await writeFile(widePath, invalidTwoPixelOutput);
+  staleWideVariant.height = 1243;
+  staleWideVariant.digest = createHash("sha256").update(invalidTwoPixelOutput).digest("hex");
+  await writeFile(packageManifestPath, `${JSON.stringify(staleVariantManifest, null, 2)}\n`);
+  const staleNarrowVariant = staleEntry.variants.find(({ width }) => width === 256);
+  await rm(path.join(rootDir, ".imagedist", staleNarrowVariant.file));
+  await processImages(options);
+  entry = JSON.parse(await readFile(packageManifestPath, "utf8")).images["src/images/sample.jpg"];
+  assert.deepEqual(entry.variants.map(({ width, height }) => [width, height]), [[256, 384], [828, 1243]]);
+  assert.notDeepEqual(await readFile(widePath), invalidTwoPixelOutput, "height errors beyond one pixel are regenerated");
+
+  const staleManifest = JSON.parse(await readFile(packageManifestPath, "utf8"));
+  for (const variant of staleManifest.images["src/images/sample.jpg"].variants) {
+    variant.height = Math.round(variant.width * 4154 / 2769);
+  }
+  await writeFile(packageManifestPath, `${JSON.stringify(staleManifest, null, 2)}\n`);
+  const warm = await processImages(options);
+  assert.equal(warm.processed, 0);
+  assert.equal(warm.skipped, 1);
+  entry = JSON.parse(await readFile(packageManifestPath, "utf8")).images["src/images/sample.jpg"];
+  assert.deepEqual(entry.variants.map(({ width, height }) => [width, height]), [[256, 384], [828, 1243]]);
+});
+
+test("SVG partial repair resets tolerated manifest height to the source height", async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "astro-image-cdn-svg-height-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const sourceDir = path.join(rootDir, "src", "images");
+  await mkdir(sourceDir, { recursive: true });
+  const sourcePath = path.join(sourceDir, "sample.svg");
+  await writeFile(sourcePath, '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50" viewBox="0 0 100 50"><rect width="100" height="50" fill="#527faa"/></svg>');
+  const options = { rootDir, formats: ["webp"], includeSourceFormat: false };
+  await processImages(options);
+
+  const manifestPath = path.join(rootDir, ".astro-image-cdn", "manifest.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  const entry = manifest.images["src/images/sample.svg"];
+  const variant = entry.variants[0];
+  variant.height = 51;
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await rm(path.join(rootDir, ".imagedist", variant.file));
+
+  const result = await processImages(options);
+  assert.equal(result.processed, 1);
+  const repairedEntry = JSON.parse(await readFile(manifestPath, "utf8")).images["src/images/sample.svg"];
+  assert.equal(repairedEntry.variants[0].height, 50);
+});
+
 async function createAdoptionFixtures(rootDir, sourcePath) {
   const sourceHash = createHash("sha256").update(await readFile(sourcePath)).digest("hex");
   const legacyDir = path.join(rootDir, ".legacy-image-variants");
@@ -241,7 +346,7 @@ test("rejects adopted outputs with the wrong dimensions or encoding before writi
 
   await assert.rejects(
     adoptImageVariants(adoptionOptions(rootDir), { sourcePath, sourceHash, variants }),
-    /does not match expected 256x128 webp/,
+    /does not match expected 256x128±1 webp/,
   );
   await assert.rejects(readFile(path.join(rootDir, ".astro-image-cdn", "manifest.json")), { code: "ENOENT" });
   assert.deepEqual(await readdir(path.join(rootDir, ".imagedist")), []);
@@ -250,10 +355,41 @@ test("rejects adopted outputs with the wrong dimensions or encoding before writi
   await sharp(sourcePath).resize({ width: 256 }).png().toFile(variants[0].path);
   await assert.rejects(
     adoptImageVariants(adoptionOptions(rootDir), { sourcePath, sourceHash, variants }),
-    /expected 256x128 webp; received 256x128 png/,
+    /expected 256x128±1 webp; received 256x128 png/,
   );
   await assert.rejects(readFile(path.join(rootDir, ".astro-image-cdn", "manifest.json")), { code: "ENOENT" });
   assert.deepEqual(await readdir(path.join(rootDir, ".imagedist")), []);
+});
+
+test("distinguishes AVIF from other HEIF media during adoption", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const sourceHash = createHash("sha256").update(await readFile(sourcePath)).digest("hex");
+  const legacyDir = path.join(rootDir, ".legacy-image-variants");
+  await mkdir(legacyDir, { recursive: true });
+  const variants = [];
+  let avifBytes;
+  for (const width of [256, 640]) {
+    const variantPath = path.join(legacyDir, `sample_${width}.avif`);
+    const bytes = await sharp(sourcePath).resize({ width, withoutEnlargement: true }).avif({ quality: 75 }).toBuffer();
+    await writeFile(variantPath, bytes);
+    if (width === 256) avifBytes = bytes;
+    variants.push({ path: variantPath, width, format: "avif" });
+  }
+
+  const options = { ...adoptionOptions(rootDir), formats: ["avif"] };
+  const heicBytes = Buffer.from(avifBytes);
+  heicBytes.write("heic", 8, "ascii");
+  await writeFile(variants[0].path, heicBytes);
+  await assert.rejects(
+    adoptImageVariants(options, { sourcePath, sourceHash, variants }),
+    /expected 256x128±1 avif; received 256x128 heif/,
+  );
+  await assert.rejects(readFile(path.join(rootDir, ".astro-image-cdn", "manifest.json")), { code: "ENOENT" });
+
+  await writeFile(variants[0].path, avifBytes);
+  const adoption = await adoptImageVariants(options, { sourcePath, sourceHash, variants });
+  assert.equal(adoption.adopted, 2);
 });
 
 test("cleans newly adopted files and preserves the old manifest after a state-read failure", async (t) => {
