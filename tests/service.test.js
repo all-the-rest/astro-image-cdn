@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -154,6 +154,53 @@ test("keeps SVG pass-through as the default and gates raster output on Astro's o
   };
   assert.equal(imageService.validateOptions({ src: svgImage }, optedInConfig).format, "svg");
   assert.equal(imageService.validateOptions({ src: svgImage, format: "webp" }, optedInConfig).format, "webp");
+});
+
+test("resolves Astro SVG imports with query metadata to their scanned source", async (t) => {
+  const rootDir = await mkdtemp(path.join(os.tmpdir(), "astro-image-cdn-service-svg-query-"));
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const sourceDir = path.join(rootDir, "src", "images");
+  await mkdir(sourceDir, { recursive: true });
+  const sourcePath = path.join(sourceDir, "bwl.svg");
+  await writeFile(sourcePath, '<svg xmlns="http://www.w3.org/2000/svg" width="64" height="32"><rect width="64" height="32" fill="#527faa"/></svg>');
+
+  const imageConfigForSvg = {
+    service: {
+      config: {
+        rootDir,
+        sources: ["src"],
+        outputDir: path.join(rootDir, ".imagedist"),
+        cacheDir: path.join(rootDir, ".astro-image-cdn"),
+        widths: [32],
+        formats: ["webp"],
+        quality: 75,
+        concurrency: 1,
+        dangerouslyProcessSVG: true,
+        includeSourceFormat: false,
+        includeNativeWidth: false,
+        autoRotate: false,
+        baseUrl: "https://cdn.example.test",
+        devMode: false,
+      },
+    },
+  };
+  const variants = await imageService.getSrcSet({
+    src: {
+      src: `/@fs/${sourcePath}?origWidth=64&origHeight=32&origFormat=svg`,
+      width: 64,
+      height: 32,
+      format: "svg",
+    },
+    width: 32,
+    height: 16,
+    format: "webp",
+    widths: [32],
+  }, imageConfigForSvg);
+
+  assert.equal(variants.length, 1);
+  assert.equal(variants[0].descriptor, "32w");
+  const url = await imageService.getURL(variants[0].transform, imageConfigForSvg);
+  assert.match(url, /^https:\/\/cdn\.example\.test\//);
 });
 
 test("batches concurrent native requests and processes each source once before resolving srcsets", async (t) => {

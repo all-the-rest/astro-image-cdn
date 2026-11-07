@@ -176,6 +176,10 @@ function sourceCandidates(value, rootDir) {
   return [...candidates];
 }
 
+function sourcePathWithoutQuery(value) {
+  return typeof value === "string" ? value.split(/[?#]/, 1)[0] : undefined;
+}
+
 function isInside(parent, candidate) {
   const relative = path.relative(parent, candidate);
   return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -210,11 +214,10 @@ async function findFilesByName(directory, fileName, matches) {
 async function requestedSourcePath(source, config) {
   if (typeof source?.fsPath === "string") return path.resolve(source.fsPath);
 
-  const sourceName = typeof source?.src === "string" ? source.src : undefined;
+  const sourceName = sourcePathWithoutQuery(source?.src);
   if (!sourceName) return undefined;
   const rootDir = path.resolve(config.rootDir);
-  const sourceNameWithoutQuery = sourceName.split(/[?#]/, 1)[0];
-  for (const candidate of sourceCandidates(sourceNameWithoutQuery, rootDir)) {
+  for (const candidate of sourceCandidates(sourceName, rootDir)) {
     const absoluteCandidate = path.resolve(rootDir, candidate);
     if (!isConfiguredSourcePath(absoluteCandidate, config)) continue;
     try {
@@ -226,7 +229,7 @@ async function requestedSourcePath(source, config) {
 
   // Astro's SVG component wrapper serializes image metadata without its private fsPath.
   // Resolve that requested import by its emitted basename, but reject ambiguous matches.
-  const basename = path.posix.basename(sourceNameWithoutQuery)
+  const basename = path.posix.basename(sourceName)
     .replace(/\.[a-z0-9_-]{8,}(?=\.[^.]+$)/i, "");
   const matches = [];
   for (const directory of (config.sources ?? ["src"]).map((sourceDirectory) => path.resolve(rootDir, sourceDirectory))) {
@@ -271,12 +274,14 @@ function resolveImage(options, imageConfig) {
   const manifest = readManifest(imageConfig);
   const rootDir = path.resolve(imageConfig.service.config.rootDir);
   const source = options.src;
+  const sourceName = typeof source === "string" ? source : source?.src;
+  const sourcePath = sourcePathWithoutQuery(sourceName);
   const possibleSources = [];
   if (isImportedImage(source)) {
     if (typeof source.fsPath === "string") possibleSources.push(...sourceCandidates(source.fsPath, rootDir));
-    possibleSources.push(...sourceCandidates(source.src, rootDir));
+    possibleSources.push(...sourceCandidates(sourcePath, rootDir));
   } else {
-    possibleSources.push(...sourceCandidates(source, rootDir));
+    possibleSources.push(...sourceCandidates(sourcePath, rootDir));
   }
 
   for (const candidate of possibleSources) {
@@ -284,9 +289,8 @@ function resolveImage(options, imageConfig) {
     if (entry) return entry;
   }
 
-  const sourceName = typeof source === "string" ? source : source?.src;
-  if (typeof sourceName === "string") {
-    const builtAssetName = path.basename(sourceName).replace(/\.[a-z0-9_-]{8,}(?=\.[^.]+$)/i, "");
+  if (typeof sourcePath === "string") {
+    const builtAssetName = path.basename(sourcePath).replace(/\.[a-z0-9_-]{8,}(?=\.[^.]+$)/i, "");
     const sameName = Object.values(manifest.images).filter((entry) => path.posix.basename(entry.source) === builtAssetName);
     const sameDimensions = sameName.filter((entry) => entry.width === source?.width && entry.height === source?.height);
     const candidates = sameDimensions.length > 0 ? sameDimensions : sameName;
