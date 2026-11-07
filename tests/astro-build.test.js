@@ -82,7 +82,9 @@ test("Astro Image, Picture, and getImage build to external variants and warm wit
         baseUrl: "https://cdn.example.test/photos",
         widths: [256, 640],
         formats: ["avif", "webp"],
-        quality: 65
+        quality: 65,
+        webpEffort: 2,
+        avifEffort: 8
       })]
     };
   `;
@@ -124,6 +126,17 @@ test("Astro Image, Picture, and getImage build to external variants and warm wit
   assert.deepEqual(entry.variants.map(({ width, format }) => `${width}.${format}`), [
     "256.avif", "256.webp", "256.png", "640.avif", "640.webp", "640.png", "840.avif", "840.webp", "840.png",
   ]);
+  const sourceBytes = await readFile(path.join(imageDir, "sample.png"));
+  for (const [format, effort] of [["webp", 2], ["avif", 8]]) {
+    const variant = entry.variants.find((candidate) => candidate.width === 256 && candidate.format === format);
+    const expectedImage = sharp(sourceBytes, { failOn: "none" })
+      .rotate()
+      .resize({ width: 256, withoutEnlargement: true });
+    const expected = format === "webp"
+      ? await expectedImage.webp({ quality: 65, effort }).toBuffer()
+      : await expectedImage.avif({ quality: 65, effort }).toBuffer();
+    assert.deepEqual(await readFile(path.join(outputDir, variant.file)), expected, `Astro build forwards ${format} effort ${effort}`);
+  }
 
   const html = await readFile(path.join(rootDir, "dist", "index.html"), "utf8");
   assert.match(html, /https:\/\/cdn\.example\.test\/photos\/[a-f0-9]{2}\/[a-f0-9]+_256\.webp/);
@@ -287,5 +300,65 @@ test("fails configuration when persistent output or cache is inside Astro public
       export default { publicDir: "./public", integrations: [astroImageCdn(${JSON.stringify(integrationOptions)})] };
     `);
     await assert.rejects(build({ root: rootDir, logLevel: "silent" }), error);
+  }
+});
+
+test("real Astro builds reject invalid encoder effort before changing output or cache", async (t) => {
+  const invalidOptions = [
+    { name: "webpEffort", value: 7, message: /webpEffort must be between 0 and 6/ },
+    { name: "avifEffort", value: 10, message: /avifEffort must be between 0 and 9/ },
+  ];
+
+  for (const invalid of invalidOptions) {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "astro-image-cdn-invalid-effort-"));
+    t.after(() => rm(rootDir, { recursive: true, force: true }));
+    const imageDir = path.join(rootDir, "src", "assets");
+    const pageDir = path.join(rootDir, "src", "pages");
+    const outputDir = path.join(rootDir, ".imagedist");
+    const cacheDir = path.join(rootDir, ".astro-image-cdn");
+    await symlink(path.join(packageRoot, "node_modules"), path.join(rootDir, "node_modules"), "dir");
+    await mkdir(imageDir, { recursive: true });
+    await mkdir(pageDir, { recursive: true });
+    await mkdir(outputDir);
+    await mkdir(cacheDir);
+    const sourcePath = path.join(imageDir, "sample.png");
+    await sharp({ create: { width: 96, height: 64, channels: 3, background: "#527faa" } }).png().toFile(sourcePath);
+    const outputSentinel = "existing generated output must remain byte-for-byte unchanged";
+    const manifestSentinel = `${JSON.stringify({ version: 2, images: { preserved: { value: "manifest" } } }, null, 2)}\n`;
+    const cacheSentinel = `${JSON.stringify({ version: 1, sources: { preserved: { fingerprint: "a".repeat(64) } } }, null, 2)}\n`;
+    await writeFile(path.join(outputDir, "sentinel.txt"), outputSentinel);
+    await writeFile(path.join(cacheDir, "manifest.json"), manifestSentinel);
+    await writeFile(path.join(cacheDir, "cache.json"), cacheSentinel);
+    const sourceBefore = await readFile(sourcePath);
+    const outputEntriesBefore = await readdir(outputDir);
+    const cacheEntriesBefore = await readdir(cacheDir);
+    await writeFile(path.join(rootDir, "astro.config.mjs"), `
+      import astroImageCdn from ${JSON.stringify(integrationEntrypoint)};
+      export default {
+        integrations: [astroImageCdn({
+          baseUrl: "https://cdn.example.test",
+          widths: [48],
+          formats: ["webp"],
+          includeSourceFormat: false,
+          includeNativeWidth: false,
+          ${invalid.name}: ${invalid.value}
+        })]
+      };
+    `);
+    await writeFile(path.join(pageDir, "index.astro"), `
+      ---
+      import { Image } from "astro:assets";
+      import sample from "../assets/sample.png";
+      ---
+      <Image src={sample} width={48} format="webp" alt="sample" />
+    `);
+
+    await assert.rejects(build({ root: rootDir, logLevel: "silent" }), invalid.message);
+    assert.deepEqual((await readdir(outputDir)).sort(), outputEntriesBefore.sort());
+    assert.deepEqual((await readdir(cacheDir)).sort(), cacheEntriesBefore.sort());
+    assert.equal(await readFile(path.join(outputDir, "sentinel.txt"), "utf8"), outputSentinel);
+    assert.equal(await readFile(path.join(cacheDir, "manifest.json"), "utf8"), manifestSentinel);
+    assert.equal(await readFile(path.join(cacheDir, "cache.json"), "utf8"), cacheSentinel);
+    assert.deepEqual(await readFile(sourcePath), sourceBefore);
   }
 });

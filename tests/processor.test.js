@@ -80,6 +80,8 @@ test("generates content-addressed variants outside dist and reuses warm outputs"
       widths: [256, 640],
       formats: ["webp", "avif"],
       quality: 70,
+      webpEffort: 4,
+      avifEffort: 4,
       transformVersion: 3,
       sharpVersion: sharp.versions.sharp,
       libvipsVersion: sharp.versions.vips,
@@ -125,6 +127,88 @@ test("generates content-addressed variants outside dist and reuses warm outputs"
   assert.ok(outputEntries.includes("manifest.json"));
   assert.equal(await readFile(legacyPublicManifest, "utf8"), "legacy public manifest");
   assert.equal(path.relative(path.join(rootDir, "dist"), path.join(rootDir, ".imagedist")).startsWith(".."), true);
+});
+
+test("uses Sharp's default and configured WebP/AVIF efforts in encoders and transform identity", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const width = 700;
+  const height = 350;
+  const channels = 3;
+  const pixels = Buffer.alloc(width * height * channels);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const offset = (y * width + x) * channels;
+      pixels[offset] = (x * 17 + y * 3 + (x * y) % 251) % 256;
+      pixels[offset + 1] = (x * 5 + y * 19 + (x * y) % 239) % 256;
+      pixels[offset + 2] = (x * 11 + y * 7 + (x * y) % 227) % 256;
+    }
+  }
+  await sharp(pixels, { raw: { width, height, channels } }).png().toFile(sourcePath);
+  const sourceBuffer = await readFile(sourcePath);
+  const sourceHash = createHash("sha256").update(sourceBuffer).digest("hex");
+  const options = {
+    rootDir,
+    widths: [256],
+    formats: ["webp", "avif"],
+    quality: 67,
+    includeSourceFormat: false,
+    includeNativeWidth: false,
+  };
+  const configurations = [
+    { name: "defaults", options: {}, webpEffort: 4, avifEffort: 4 },
+    { name: "explicit defaults", options: { webpEffort: 4, avifEffort: 4 }, webpEffort: 4, avifEffort: 4 },
+    { name: "WebP override", options: { webpEffort: 0 }, webpEffort: 0, avifEffort: 4 },
+    { name: "WebP maximum", options: { webpEffort: 6 }, webpEffort: 6, avifEffort: 4 },
+    { name: "AVIF minimum", options: { avifEffort: 0 }, webpEffort: 4, avifEffort: 0 },
+    { name: "AVIF override", options: { avifEffort: 9 }, webpEffort: 4, avifEffort: 9 },
+  ];
+  const fingerprints = new Map();
+  const cacheFingerprints = new Map();
+  const pathsByFormat = { webp: new Set(), avif: new Set() };
+  const manifestPath = path.join(rootDir, ".astro-image-cdn", "manifest.json");
+  const cachePath = path.join(rootDir, ".astro-image-cdn", "cache.json");
+
+  for (const configuration of configurations) {
+    const result = await processImages({ ...options, ...configuration.options });
+    const entry = JSON.parse(await readFile(manifestPath, "utf8")).images["src/images/sample.png"];
+    const cache = JSON.parse(await readFile(cachePath, "utf8"));
+    assert.equal(entry.sourceHash, sourceHash, "sourceHash must describe only the original source bytes");
+    assert.match(entry.sourceHash, /^[a-f0-9]{64}$/);
+    assert.equal(cache.sources["src/images/sample.png"].fingerprint, entry.fingerprint);
+    assert.deepEqual(entry.variants.map(({ format }) => format), ["webp", "avif"]);
+
+    const priorFingerprint = fingerprints.get(`${configuration.webpEffort}:${configuration.avifEffort}`);
+    if (configuration.name === "explicit defaults") {
+      assert.equal(result.processed, 0);
+      assert.equal(result.skipped, 1);
+      assert.equal(entry.fingerprint, fingerprints.get("4:4"));
+      assert.equal(cache.sources["src/images/sample.png"].fingerprint, fingerprints.get("4:4"));
+    } else {
+      if (priorFingerprint) assert.equal(entry.fingerprint, priorFingerprint);
+      fingerprints.set(`${configuration.webpEffort}:${configuration.avifEffort}`, entry.fingerprint);
+      cacheFingerprints.set(`${configuration.webpEffort}:${configuration.avifEffort}`, cache.sources["src/images/sample.png"].fingerprint);
+    }
+
+    for (const variant of entry.variants) {
+      const filePath = path.join(rootDir, ".imagedist", variant.file);
+      const expectedImage = sharp(sourceBuffer, { failOn: "none" })
+        .rotate()
+        .resize({ width: variant.width, withoutEnlargement: true });
+      const usesSharpDefaults = configuration.name === "defaults";
+      const expected = variant.format === "webp"
+        ? await expectedImage.webp({ quality: 67, ...(usesSharpDefaults ? {} : { effort: configuration.webpEffort }) }).toBuffer()
+        : await expectedImage.avif({ quality: 67, ...(usesSharpDefaults ? {} : { effort: configuration.avifEffort }) }).toBuffer();
+      assert.deepEqual(await readFile(filePath), expected, `${configuration.name} ${variant.format} output uses its configured Sharp effort`);
+      pathsByFormat[variant.format].add(variant.file);
+    }
+  }
+
+  assert.equal(fingerprints.size, 5, "explicit defaults share the same effective transform policy");
+  assert.equal(new Set(fingerprints.values()).size, 5, "changing either format's effort changes the transform fingerprint");
+  assert.equal(new Set(cacheFingerprints.values()).size, 5, "the cache records each distinct effective transform fingerprint");
+  assert.equal(pathsByFormat.webp.size, 5, "different effective policies use distinct WebP variant paths");
+  assert.equal(pathsByFormat.avif.size, 5, "different effective policies use distinct AVIF variant paths");
 });
 
 test("output options select exact formats and widths and can disable EXIF auto-rotation", async (t) => {
@@ -413,6 +497,8 @@ test("cleans newly adopted files and preserves the old manifest after a state-re
       widths: [256, 640, 828],
       formats: ["webp"],
       quality: 75,
+      webpEffort: 4,
+      avifEffort: 4,
       transformVersion: 3,
       sharpVersion: sharp.versions.sharp,
       libvipsVersion: sharp.versions.vips,
@@ -475,7 +561,7 @@ test("targeted image batches deduplicate files, preserve unrelated state, and le
 });
 
 test("rejects invalid encoder settings before touching output", async (t) => {
-  const { rootDir } = await createProject();
+  const { rootDir, sourcePath } = await createProject();
   t.after(() => rm(rootDir, { recursive: true, force: true }));
   await assert.rejects(
     processImages({ rootDir, formats: ["gif"] }),
@@ -485,6 +571,36 @@ test("rejects invalid encoder settings before touching output", async (t) => {
     processImages({ rootDir, sources: ["../outside"] }),
     /must remain inside rootDir/,
   );
+
+  const validOptions = { rootDir, widths: [256], formats: ["webp"], includeSourceFormat: false };
+  await processImages(validOptions);
+  const manifestPath = path.join(rootDir, ".astro-image-cdn", "manifest.json");
+  const cachePath = path.join(rootDir, ".astro-image-cdn", "cache.json");
+  const entry = JSON.parse(await readFile(manifestPath, "utf8")).images["src/images/sample.png"];
+  const paths = [sourcePath, manifestPath, cachePath, ...entry.variants.map(({ file }) => path.join(rootDir, ".imagedist", file))];
+  const originalBytes = await Promise.all(paths.map((filePath) => readFile(filePath)));
+  const outputDir = path.join(rootDir, ".imagedist");
+  const variantDirectory = path.join(outputDir, entry.variants[0].file.slice(0, 2));
+  const outputEntries = await readdir(outputDir);
+  const variantEntries = await readdir(variantDirectory);
+  const cacheEntries = await readdir(path.join(rootDir, ".astro-image-cdn"));
+  const invalidEfforts = [
+    [{ webpEffort: -1 }, /webpEffort must be between 0 and 6/],
+    [{ webpEffort: 7 }, /webpEffort must be between 0 and 6/],
+    [{ webpEffort: 1.5 }, /webpEffort must be an integer between 0 and 6/],
+    [{ webpEffort: null }, /webpEffort must be an integer between 0 and 6/],
+    [{ avifEffort: -1 }, /avifEffort must be between 0 and 9/],
+    [{ avifEffort: 10 }, /avifEffort must be between 0 and 9/],
+    [{ avifEffort: 1.5 }, /avifEffort must be an integer between 0 and 9/],
+    [{ avifEffort: null }, /avifEffort must be an integer between 0 and 9/],
+  ];
+  for (const [invalid, message] of invalidEfforts) {
+    await assert.rejects(processImages({ ...validOptions, ...invalid }), message);
+  }
+  assert.deepEqual(await Promise.all(paths.map((filePath) => readFile(filePath))), originalBytes);
+  assert.deepEqual(await readdir(outputDir), outputEntries);
+  assert.deepEqual(await readdir(variantDirectory), variantEntries);
+  assert.deepEqual(await readdir(path.join(rootDir, ".astro-image-cdn")), cacheEntries);
 });
 
 test("rejects source directories whose symlinks resolve outside the project root", async (t) => {

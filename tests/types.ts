@@ -5,6 +5,8 @@ const options: AstroImageCdnOptions = {
   sources: ["src"],
   widths: [320, 640],
   formats: ["avif", "webp"],
+  webpEffort: 2,
+  avifEffort: 7,
   includeSourceFormat: false,
   includeNativeWidth: false,
   autoRotate: false,
@@ -13,7 +15,7 @@ const options: AstroImageCdnOptions = {
 
 const integration = astroImageCdn(options);
 const localDevIntegration = astroImageCdn({ devOnly: true });
-const processing = processImages({ rootDir: process.cwd(), sources: ["src"] });
+const processing = processImages({ rootDir: process.cwd(), sources: ["src"], webpEffort: 0, avifEffort: 9 });
 const adoption = adoptImageVariants({
   rootDir: process.cwd(),
   formats: ["webp"],
