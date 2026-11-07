@@ -121,9 +121,9 @@ ratchet check
 
 The tests include real Astro static builds using `Image`, `Picture`, and `getImage()`, a real dev-server request served from local output, unrequested-image checks, a repeated warm build, and assertions that optimized variants remain outside `dist/`.
 
-The npm workflow publishes only pushed `vMAJOR.MINOR.PATCH` version tags whose version matches `package.json`; verification and packaging use pnpm in a separate job without OIDC, while the minimal publishing job downloads the verified tarball and uses npm CLI only for OIDC publishing. Configure `@all-the.rest/astro-image-cdn` on npm to trust this repository's `.github/workflows/publish.yml` and allow `npm publish`.
+The npm workflow publishes only pushed `vMAJOR.MINOR.PATCH` version tags whose version matches `package.json`; verification and packaging use pnpm in a separate job without OIDC, while the minimal publishing job downloads the verified tarball and uses npm CLI only for OIDC publishing. The package's npm Trusted Publisher is configured for this repository's `.github/workflows/publish.yml` and the `npm publish` action.
 
-npm requires a package to exist before a trusted publisher can be configured ([`npm trust` prerequisites](https://docs.npmjs.com/cli/v12/commands/npm-trust/#prerequisites)). This package is not published yet, so its initial registry creation needs a separately approved one-time bootstrap path. After the package exists and the GitHub Actions trusted publisher is configured, version-tag releases use OIDC without a long-lived npm publish token. No package has been published by this project setup.
+Version 0.1.0 was bootstrapped manually because npm requires a package to exist before a trusted publisher can be configured ([`npm trust` prerequisites](https://docs.npmjs.com/cli/v12/commands/npm-trust/#prerequisites)). Subsequent version-tag releases use GitHub Actions OIDC and npm provenance, without a long-lived publish token. A new trusted-publisher configuration must complete its first successful publish within two days or it expires.
 
 ## Provenance and license
 

@@ -1,6 +1,6 @@
 {
   "name": "@all-the.rest/astro-image-cdn",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Persistent, incremental image variants for Astro's native image components",
   "type": "module",
   "license": "ISC",
