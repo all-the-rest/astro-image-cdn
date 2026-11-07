@@ -1,0 +1,23 @@
+name: Ratchet
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Project gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: all-the-rest/ratchet-cli@4cace52ac7731985130292ead6ae81d44b4d72d6
+        with:
+          mode: validate

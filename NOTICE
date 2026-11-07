@@ -1,0 +1,7 @@
+This package independently reimplements image-processing behavior reviewed in
+packages/tools/scripts/process-images.mjs from reisinger.pictures:
+https://github.com/reisinger-pictures/reisinger.pictures
+
+The upstream root package.json declares the ISC license. The repository has no
+root LICENSE file and the referenced script has no separate license header.
+No source code was copied verbatim into this package.

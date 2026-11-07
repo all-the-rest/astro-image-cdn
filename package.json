@@ -1,0 +1,46 @@
+{
+  "name": "@all-the.rest/astro-image-cdn",
+  "version": "0.1.0",
+  "description": "Persistent, incremental image variants for Astro's native image components",
+  "type": "module",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/all-the-rest/astro-image-cdn.git"
+  },
+  "homepage": "https://github.com/all-the-rest/astro-image-cdn#readme",
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    },
+    "./service": "./src/service.js"
+  },
+  "engines": {
+    "node": ">=22.22.0"
+  },
+  "peerDependencies": {
+    "astro": ">=7.4.0"
+  },
+  "dependencies": {
+    "sharp": "^0.35.5"
+  },
+  "scripts": {
+    "test": "node --test",
+    "test:astro": "node --test tests/astro-build.test.js",
+    "check": "node --check src/index.js && node --check src/processor.js && node --check src/service.js && node --check src/dev-server.js && pnpm typecheck && pnpm test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.3",
+    "astro": "7.4.1",
+    "typescript": "5.9.3"
+  },
+  "packageManager": "pnpm@11.23.0"
+}
