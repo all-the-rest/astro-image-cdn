@@ -58,6 +58,19 @@ test("defaults raster images to WebP and explains when that output is unavailabl
   );
 });
 
+test("validates source-format availability when only configured output formats are generated", () => {
+  const webpOnlyConfig = {
+    service: {
+      config: { ...imageConfig.service.config, formats: ["webp"], includeSourceFormat: false },
+    },
+  };
+  assert.equal(imageService.validateOptions({ src: image }, webpOnlyConfig).format, "webp");
+  assert.throws(
+    () => imageService.validateOptions({ src: image, format: "png" }, webpOnlyConfig),
+    /format "png" is not configured for generation/,
+  );
+});
+
 test("preserves Astro validation for remote dimensions and incompatible descriptors", () => {
   assert.throws(
     () => imageService.validateOptions({ src: "https://images.example.test/photo.jpg" }, imageConfig),

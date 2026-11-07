@@ -119,6 +119,9 @@ function resolveOptions(options) {
   const quality = options.quality ?? 75;
   const concurrency = options.concurrency ?? 4;
   const dangerouslyProcessSVG = options.dangerouslyProcessSVG ?? false;
+  const includeSourceFormat = options.includeSourceFormat ?? true;
+  const includeNativeWidth = options.includeNativeWidth ?? true;
+  const autoRotate = options.autoRotate ?? true;
 
   for (const width of widths) validatePositiveInteger(width, "widths");
   for (const format of formats) {
@@ -131,10 +134,27 @@ function resolveOptions(options) {
   if (typeof dangerouslyProcessSVG !== "boolean") {
     throw new TypeError("dangerouslyProcessSVG must be a boolean");
   }
+  for (const [label, value] of Object.entries({ includeSourceFormat, includeNativeWidth, autoRotate })) {
+    if (typeof value !== "boolean") throw new TypeError(`${label} must be a boolean`);
+  }
   if (quality > 100) throw new RangeError("quality must be between 1 and 100");
   if (formats.length === 0) throw new TypeError("formats must contain at least one image format");
 
-  return { rootDir, sourceDirectories, publicDir, outputDir, cacheDir, widths, formats, quality, concurrency, dangerouslyProcessSVG };
+  return {
+    rootDir,
+    sourceDirectories,
+    publicDir,
+    outputDir,
+    cacheDir,
+    widths,
+    formats,
+    quality,
+    concurrency,
+    dangerouslyProcessSVG,
+    includeSourceFormat,
+    includeNativeWidth,
+    autoRotate,
+  };
 }
 
 async function walk(directory, output, excludedPaths) {
@@ -215,7 +235,7 @@ function hasAvifSequenceBrand(buffer) {
   return false;
 }
 
-async function imageMetadata(buffer, filePath) {
+async function imageMetadata(buffer, filePath, autoRotate = true) {
   if (hasAvifSequenceBrand(buffer)) {
     throw new Error(`Animated or multi-page image sources are not supported: ${filePath} is an AVIF image sequence.`);
   }
@@ -233,7 +253,7 @@ async function imageMetadata(buffer, filePath) {
   if ((metadata.pages ?? 1) > 1) {
     throw new Error(`Animated or multi-page image sources are not supported: ${filePath} (${metadata.mediaType ?? metadata.format}, ${metadata.pages} pages).`);
   }
-  const rotated = metadata.orientation >= 5 && metadata.orientation <= 8;
+  const rotated = autoRotate && metadata.orientation >= 5 && metadata.orientation <= 8;
   return {
     width: rotated ? metadata.height : metadata.width,
     height: rotated ? metadata.width : metadata.height,
@@ -243,6 +263,42 @@ async function imageMetadata(buffer, filePath) {
 
 function getVariants(width, formats) {
   return formats.map((format) => ({ width, format }));
+}
+
+function pipelineSettings(options) {
+  return JSON.stringify({
+    widths: options.widths,
+    formats: options.formats,
+    quality: options.quality,
+    transformVersion: TRANSFORM_VERSION,
+    sharpVersion: sharp.versions.sharp,
+    libvipsVersion: sharp.versions.vips,
+    dangerouslyProcessSVG: options.dangerouslyProcessSVG,
+    includeSourceFormat: options.includeSourceFormat,
+    includeNativeWidth: options.includeNativeWidth,
+    autoRotate: options.autoRotate,
+  });
+}
+
+function expectedVariants(fingerprint, dimensions, sourceFormat, options) {
+  const targetWidths = options.widths.filter((width) => width <= dimensions.width);
+  if (options.includeNativeWidth || (sourceFormat === "svg" && (!options.dangerouslyProcessSVG || options.includeSourceFormat))) {
+    targetWidths.push(dimensions.width);
+  }
+  const uniqueWidths = [...new Set(targetWidths)].sort((a, b) => a - b);
+  const generatedFormats = sourceFormat === "svg" && !options.dangerouslyProcessSVG
+    ? ["svg"]
+    : options.includeSourceFormat && SUPPORTED_FORMATS.has(sourceFormat)
+      ? [...new Set([...options.formats, sourceFormat])]
+      : options.formats;
+
+  return uniqueWidths.flatMap((width) => getVariants(width, generatedFormats)
+    .filter((variant) => variant.format !== "svg" || width === dimensions.width)
+    .map((variant) => ({
+      ...variant,
+      height: Math.max(1, Math.round(width * dimensions.height / dimensions.width)),
+      file: `${fingerprint.slice(0, 2)}/${fingerprint}_${width}.${variant.format}`,
+    })));
 }
 
 async function variantMatches(outputDir, variant) {
@@ -338,12 +394,14 @@ async function ensureVariantDirectory(outputDir, file) {
   return filePath;
 }
 
-async function writeVariant(buffer, filePath, width, format, quality) {
+async function writeVariant(buffer, filePath, width, format, quality, autoRotate) {
   if (format === "svg") {
     await atomicWrite(filePath, buffer);
     return digest(buffer);
   }
-  const image = sharp(buffer, { failOn: "none" }).rotate().resize({ width, withoutEnlargement: true });
+  const image = sharp(buffer, { failOn: "none" });
+  if (autoRotate) image.rotate();
+  image.resize({ width, withoutEnlargement: true });
   if (format === "avif") image.avif({ quality });
   else if (format === "webp") image.webp({ quality });
   else if (format === "jpeg") image.jpeg({ quality });
@@ -371,7 +429,7 @@ async function mapConcurrent(items, concurrency, callback) {
 
 async function processImagesFromFiles(rawOptions, requestedFiles) {
   const options = resolveOptions(rawOptions);
-  const { rootDir, sourceDirectories, publicDir, widths, formats, quality, concurrency, dangerouslyProcessSVG } = options;
+  const { rootDir, sourceDirectories, publicDir, widths, formats, quality, concurrency, dangerouslyProcessSVG, autoRotate } = options;
   let { outputDir, cacheDir } = options;
   const reportedManifestPath = path.join(cacheDir, "manifest.json");
   const canonicalRoot = await canonicalizePath(rootDir);
@@ -468,15 +526,7 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
     let processed = 0;
     let skipped = 0;
 
-    const pipeline = JSON.stringify({
-      widths,
-      formats,
-      quality,
-      transformVersion: TRANSFORM_VERSION,
-      sharpVersion: sharp.versions.sharp,
-      libvipsVersion: sharp.versions.vips,
-      dangerouslyProcessSVG,
-    });
+    const pipeline = pipelineSettings(options);
 
     const results = await mapConcurrent(files, concurrency, async (sourcePath) => {
       const relativePath = normalizeRelativePath(path.relative(rootDir, sourcePath));
@@ -485,18 +535,9 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
       const fingerprint = digest(`${sourceHash}\0${pipeline}`);
       const cacheEntry = oldCache.sources?.[relativePath];
       const previousEntry = oldManifest.images?.[relativePath];
-      const dimensions = await imageMetadata(sourceBuffer, sourcePath);
+      const dimensions = await imageMetadata(sourceBuffer, sourcePath, autoRotate);
       const sourceFormat = normalizeFormat(dimensions.format);
-      const targetWidths = [...new Set([...widths.filter((width) => width < dimensions.width), dimensions.width])].sort((a, b) => a - b);
-      const generatedFormats = sourceFormat === "svg" && !dangerouslyProcessSVG
-        ? ["svg"]
-        : SUPPORTED_FORMATS.has(sourceFormat) ? [...new Set([...formats, sourceFormat])] : formats;
-      const expectedVariants = targetWidths.flatMap((width) => getVariants(width, generatedFormats)
-        .filter((variant) => variant.format !== "svg" || width === dimensions.width)
-        .map((variant) => {
-          const file = `${fingerprint.slice(0, 2)}/${fingerprint}_${width}.${variant.format}`;
-          return { ...variant, height: Math.max(1, Math.round(width * dimensions.height / dimensions.width)), file };
-        }));
+      const expected = expectedVariants(fingerprint, dimensions, sourceFormat, options);
 
       const isWarm = cacheEntry?.fingerprint === fingerprint
         && previousEntry?.fingerprint === fingerprint
@@ -504,21 +545,21 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
         && previousEntry.width === dimensions.width
         && previousEntry.height === dimensions.height
         && previousEntry.sourceFormat === dimensions.format
-        && hasCompleteVariantSet(previousEntry.variants, expectedVariants)
+        && hasCompleteVariantSet(previousEntry.variants, expected)
         && await outputExists(outputDir, previousEntry.variants);
       let variants;
       if (isWarm) {
         variants = previousEntry.variants;
         skipped++;
       } else {
-        variants = carryForwardVariantDigests(expectedVariants, previousEntry?.variants);
+        variants = carryForwardVariantDigests(expected, previousEntry?.variants);
         const missingVariants = [];
         for (const variant of variants) {
           if (!await variantMatches(outputDir, variant)) missingVariants.push(variant);
         }
         await mapConcurrent(missingVariants, Math.min(concurrency, 4), async (variant) => {
           const targetPath = await ensureVariantDirectory(outputDir, variant.file);
-          variant.digest = await writeVariant(sourceBuffer, targetPath, variant.width, variant.format, quality);
+          variant.digest = await writeVariant(sourceBuffer, targetPath, variant.width, variant.format, quality, autoRotate);
         });
         processed++;
       }
@@ -549,6 +590,214 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
     if (cacheJson !== `${JSON.stringify(oldCache, null, 2)}\n`) await atomicWrite(cachePath, cacheJson);
 
     return { processed, skipped, imageCount: files.length, manifestPath: reportedManifestPath, legacyPublicManifestPath };
+  } finally {
+    await releaseLocks();
+  }
+}
+
+/** Adopt existing image outputs into the current content-addressed layout without re-encoding. */
+export async function adoptImageVariants(rawOptions, adoption) {
+  const options = resolveOptions(rawOptions);
+  if (!adoption || typeof adoption.sourcePath !== "string") {
+    throw new TypeError("adoptImageVariants requires a sourcePath");
+  }
+  if (!/^[a-f0-9]{64}$/.test(adoption.sourceHash ?? "")) {
+    throw new TypeError("adoptImageVariants requires a lowercase SHA-256 sourceHash");
+  }
+  if (!Array.isArray(adoption.variants)) {
+    throw new TypeError("adoptImageVariants requires a variants array");
+  }
+
+  const { rootDir, sourceDirectories, publicDir } = options;
+  const sourcePath = path.resolve(rootDir, adoption.sourcePath);
+  const relativePath = path.relative(rootDir, sourcePath);
+  if (relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    throw new Error(`Adopted source must remain inside rootDir: ${sourcePath}`);
+  }
+
+  const canonicalRoot = await realpath(rootDir);
+  const canonicalSources = [];
+  for (const sourceDirectory of sourceDirectories) {
+    const relative = path.relative(rootDir, sourceDirectory);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(`Image source directory must remain inside rootDir: ${sourceDirectory}`);
+    }
+    const canonicalSource = await canonicalizePath(sourceDirectory);
+    if (!isInside(canonicalRoot, canonicalSource)) {
+      throw new Error(`Image source directory must remain inside rootDir after resolving symlinks: ${sourceDirectory}`);
+    }
+    canonicalSources.push(canonicalSource);
+  }
+
+  const sourceInfo = await lstat(sourcePath);
+  if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) {
+    throw new Error(`Adopted source must be a regular file, not a symlink: ${sourcePath}`);
+  }
+  const canonicalSourcePath = await realpath(sourcePath);
+  if (!isInside(canonicalRoot, canonicalSourcePath) || !canonicalSources.some((directory) => isInside(directory, canonicalSourcePath))) {
+    throw new Error(`Adopted source must be inside one of the configured image source directories: ${sourcePath}`);
+  }
+
+  const canonicalOutputDir = await canonicalizePath(options.outputDir);
+  const canonicalCacheDir = await canonicalizePath(options.cacheDir);
+  const canonicalPublicDir = await canonicalizePath(publicDir);
+  if (pathsOverlap(canonicalOutputDir, canonicalCacheDir)) {
+    throw new Error(`outputDir and cacheDir must not overlap: ${canonicalOutputDir} and ${canonicalCacheDir}`);
+  }
+  for (const [label, directory] of [["outputDir", canonicalOutputDir], ["cacheDir", canonicalCacheDir]]) {
+    if (isInside(canonicalPublicDir, directory)) {
+      throw new Error(`Image ${label} must be outside Astro's public directory, including through symlinks: ${directory}`);
+    }
+    if (canonicalSources.some((sourceDirectory) => pathsOverlap(sourceDirectory, directory))) {
+      throw new Error(`Image ${label} must not overlap a scanned source directory, including through symlinks: ${directory}`);
+    }
+  }
+
+  for (const [index, variant] of adoption.variants.entries()) {
+    if (!variant || typeof variant.path !== "string") {
+      throw new TypeError(`Adopted variant ${index} requires a path`);
+    }
+    validatePositiveInteger(variant.width, "variant width");
+    const format = normalizeFormat(variant.format);
+    if (!SUPPORTED_FORMATS.has(format)) {
+      throw new TypeError(`Unsupported adopted variant format "${variant.format}"`);
+    }
+  }
+
+  await mkdir(options.outputDir, { recursive: true });
+  await mkdir(options.cacheDir, { recursive: true });
+  const outputDir = await realpath(options.outputDir);
+  const cacheDir = await realpath(options.cacheDir);
+  const releaseLocks = await acquireWriterLocks([outputDir, cacheDir]);
+  const createdPaths = [];
+  try {
+    const sourceBuffer = await readFile(sourcePath);
+    const sourceHash = digest(sourceBuffer);
+    if (sourceHash !== adoption.sourceHash) {
+      throw new Error(`Adopted source changed: expected SHA-256 ${adoption.sourceHash}, received ${sourceHash} for ${sourcePath}`);
+    }
+
+    const dimensions = await imageMetadata(sourceBuffer, sourcePath, options.autoRotate);
+    const sourceFormat = normalizeFormat(dimensions.format);
+    const fingerprint = digest(`${sourceHash}\0${pipelineSettings(options)}`);
+    const expected = expectedVariants(fingerprint, dimensions, sourceFormat, options);
+    const supplied = new Map();
+    for (const variant of adoption.variants) {
+      const key = variantKey({ width: variant.width, format: normalizeFormat(variant.format) });
+      if (supplied.has(key)) throw new Error(`Duplicate adopted variant for ${variant.width}.${normalizeFormat(variant.format)}`);
+      supplied.set(key, variant);
+    }
+
+    const validated = [];
+    for (const expectedVariant of expected) {
+      const suppliedVariant = supplied.get(variantKey(expectedVariant));
+      if (!suppliedVariant) {
+        throw new Error(`Missing adopted variant ${expectedVariant.width}.${expectedVariant.format} for ${relativePath}`);
+      }
+      const inputPath = path.resolve(rootDir, suppliedVariant.path);
+      const inputInfo = await lstat(inputPath);
+      if (!inputInfo.isFile() || inputInfo.isSymbolicLink()) {
+        throw new Error(`Adopted variant must be a regular file, not a symlink: ${inputPath}`);
+      }
+      const buffer = await readFile(inputPath);
+      let metadata;
+      try {
+        metadata = await sharp(buffer, { failOn: "none" }).metadata();
+      } catch (error) {
+        throw new Error(`Unable to read adopted variant ${inputPath}: ${error.message}`, { cause: error });
+      }
+      const actualFormat = normalizeFormat(metadata.format);
+      const actualHeight = Math.max(1, Math.round(expectedVariant.width * dimensions.height / dimensions.width));
+      if (actualFormat !== expectedVariant.format || metadata.width !== expectedVariant.width || metadata.height !== actualHeight) {
+        throw new Error(
+          `Adopted variant ${inputPath} does not match expected ${expectedVariant.width}x${actualHeight} ${expectedVariant.format}; ` +
+          `received ${metadata.width}x${metadata.height} ${actualFormat}.`,
+        );
+      }
+      validated.push({
+        ...expectedVariant,
+        digest: digest(buffer),
+        buffer,
+      });
+    }
+
+    const outputVariants = validated.map(({ buffer, ...variant }) => variant);
+    const writeTargets = [];
+    for (const variant of validated) {
+      const targetPath = await ensureVariantDirectory(outputDir, variant.file);
+      try {
+        const info = await lstat(targetPath);
+        if (!info.isFile() || info.isSymbolicLink() || !await variantMatches(outputDir, variant)) {
+          throw new Error(`Refusing to replace an existing non-matching adopted output: ${targetPath}`);
+        }
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        writeTargets.push({ targetPath, variant });
+      }
+    }
+
+    for (const { targetPath, variant } of writeTargets) {
+      const sourceVariant = validated.find((candidate) => candidate.file === variant.file);
+      await atomicWrite(targetPath, sourceVariant.buffer);
+      createdPaths.push({ targetPath, variant });
+    }
+
+    if (digest(await readFile(sourcePath)) !== sourceHash) {
+      throw new Error(`Adopted source changed during migration: ${sourcePath}`);
+    }
+
+    const manifestPath = path.join(cacheDir, "manifest.json");
+    const cachePath = path.join(cacheDir, "cache.json");
+    const [oldManifest, oldCache, oldCacheText] = await Promise.all([
+      readJson(manifestPath, { version: MANIFEST_VERSION, images: {} }),
+      readJson(cachePath, { version: CACHE_VERSION, sources: {} }),
+      readFile(cachePath, "utf8").catch((error) => error.code === "ENOENT" ? undefined : Promise.reject(error)),
+    ]);
+    const manifest = {
+      version: MANIFEST_VERSION,
+      images: oldManifest.images && typeof oldManifest.images === "object" ? { ...oldManifest.images } : {},
+    };
+    const cache = {
+      version: CACHE_VERSION,
+      sources: oldCache.sources && typeof oldCache.sources === "object" ? { ...oldCache.sources } : {},
+    };
+    manifest.images[normalizeRelativePath(relativePath)] = {
+      source: normalizeRelativePath(relativePath),
+      fingerprint,
+      sourceHash,
+      sourceFormat: dimensions.format,
+      width: dimensions.width,
+      height: dimensions.height,
+      variants: outputVariants,
+    };
+    cache.sources[normalizeRelativePath(relativePath)] = { fingerprint };
+    const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
+    const cacheJson = `${JSON.stringify(cache, null, 2)}\n`;
+    const manifestChanged = manifestJson !== `${JSON.stringify(oldManifest, null, 2)}\n`;
+    const cacheChanged = cacheJson !== `${JSON.stringify(oldCache, null, 2)}\n`;
+
+    if (cacheChanged) await atomicWrite(cachePath, cacheJson);
+    try {
+      if (manifestChanged) await atomicWrite(manifestPath, manifestJson);
+    } catch (error) {
+      if (cacheChanged) {
+        if (oldCacheText === undefined) await unlink(cachePath).catch(() => {});
+        else await atomicWrite(cachePath, oldCacheText).catch(() => {});
+      }
+      throw error;
+    }
+
+    return {
+      fingerprint,
+      adopted: outputVariants.length,
+      reused: outputVariants.length - writeTargets.length,
+      manifestPath,
+    };
+  } catch (error) {
+    for (const { targetPath, variant } of createdPaths.reverse()) {
+      if (await variantMatches(outputDir, variant).catch(() => false)) await unlink(targetPath).catch(() => {});
+    }
+    throw error;
   } finally {
     await releaseLocks();
   }

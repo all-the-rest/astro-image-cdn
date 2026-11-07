@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import sharp from "sharp";
-import { processImages, processRequestedImages } from "../src/processor.js";
+import { adoptImageVariants, processImages, processRequestedImages } from "../src/processor.js";
 
 async function createProject() {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "astro-image-cdn-processor-"));
@@ -84,6 +84,9 @@ test("generates content-addressed variants outside dist and reuses warm outputs"
       sharpVersion: sharp.versions.sharp,
       libvipsVersion: sharp.versions.vips,
       dangerouslyProcessSVG: false,
+      includeSourceFormat: true,
+      includeNativeWidth: true,
+      autoRotate: true,
     })}`)
     .digest("hex");
   assert.equal(entry.fingerprint, expectedFingerprint, "the fingerprint should include Sharp, libvips, and transform versions");
@@ -122,6 +125,169 @@ test("generates content-addressed variants outside dist and reuses warm outputs"
   assert.ok(outputEntries.includes("manifest.json"));
   assert.equal(await readFile(legacyPublicManifest, "utf8"), "legacy public manifest");
   assert.equal(path.relative(path.join(rootDir, "dist"), path.join(rootDir, ".imagedist")).startsWith(".."), true);
+});
+
+test("output options select exact formats and widths and can disable EXIF auto-rotation", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  await sharp({ create: { width: 700, height: 350, channels: 3, background: "#527faa" } })
+    .jpeg()
+    .withMetadata({ orientation: 6 })
+    .toFile(sourcePath.replace(/\.png$/, ".jpg"));
+  await rm(sourcePath);
+  const orientedSourcePath = sourcePath.replace(/\.png$/, ".jpg");
+  const options = {
+    rootDir,
+    widths: [256, 640, 828],
+    formats: ["webp"],
+    includeSourceFormat: false,
+    includeNativeWidth: false,
+    autoRotate: false,
+  };
+
+  await processImages(options);
+  const manifestPath = path.join(rootDir, ".astro-image-cdn", "manifest.json");
+  let entry = JSON.parse(await readFile(manifestPath, "utf8")).images["src/images/sample.jpg"];
+  assert.equal(entry.width, 700);
+  assert.equal(entry.height, 350);
+  assert.deepEqual(entry.variants.map(({ width, format }) => `${width}.${format}`), ["256.webp", "640.webp"]);
+  assert.equal((await sharp(path.join(rootDir, ".imagedist", entry.variants[0].file)).metadata()).height, 128);
+
+  await processImages({ ...options, autoRotate: true });
+  const rotatedEntry = JSON.parse(await readFile(manifestPath, "utf8")).images["src/images/sample.jpg"];
+  assert.notEqual(rotatedEntry.fingerprint, entry.fingerprint, "auto-rotation must be part of the pipeline identity");
+  assert.equal(rotatedEntry.width, 350);
+  assert.equal(rotatedEntry.height, 700);
+  assert.deepEqual(rotatedEntry.variants.map(({ width, format }) => `${width}.${format}`), ["256.webp"]);
+  assert.equal((await sharp(path.join(rootDir, ".imagedist", rotatedEntry.variants[0].file)).metadata()).height, 512);
+});
+
+async function createAdoptionFixtures(rootDir, sourcePath) {
+  const sourceHash = createHash("sha256").update(await readFile(sourcePath)).digest("hex");
+  const legacyDir = path.join(rootDir, ".legacy-image-variants");
+  await mkdir(legacyDir, { recursive: true });
+  const variants = [];
+  for (const width of [256, 640]) {
+    const variantPath = path.join(legacyDir, `sample_${width}.webp`);
+    await sharp(sourcePath).resize({ width, withoutEnlargement: true }).webp({ quality: 75 }).toFile(variantPath);
+    variants.push({ path: variantPath, width, format: "webp" });
+  }
+  return { sourceHash, variants };
+}
+
+const adoptionOptions = (rootDir) => ({
+  rootDir,
+  widths: [256, 640, 828],
+  formats: ["webp"],
+  includeSourceFormat: false,
+  includeNativeWidth: false,
+  autoRotate: false,
+});
+
+test("adopts matching existing variants, reuses them warm, and is idempotent", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const { sourceHash, variants } = await createAdoptionFixtures(rootDir, sourcePath);
+  const options = adoptionOptions(rootDir);
+  const input = { sourcePath, sourceHash, variants };
+
+  const first = await adoptImageVariants(options, input);
+  assert.equal(first.adopted, 2);
+  assert.equal(first.reused, 0);
+  const manifestBefore = await readFile(first.manifestPath, "utf8");
+  const entry = JSON.parse(manifestBefore).images["src/images/sample.png"];
+  assert.deepEqual(entry.variants.map(({ width, format }) => `${width}.${format}`), ["256.webp", "640.webp"]);
+  for (const variant of entry.variants) {
+    const targetPath = path.join(rootDir, ".imagedist", variant.file);
+    assert.equal(createHash("sha256").update(await readFile(targetPath)).digest("hex"), variant.digest);
+  }
+
+  const second = await adoptImageVariants(options, input);
+  assert.equal(second.reused, 2);
+  assert.equal(await readFile(first.manifestPath, "utf8"), manifestBefore);
+  const warm = await processImages(options);
+  assert.equal(warm.processed, 0);
+  assert.equal(warm.skipped, 1, "the adopted manifest and files should be a normal warm cache entry");
+});
+
+test("rejects stale sources and incomplete variant sets without changing prior state", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const { sourceHash, variants } = await createAdoptionFixtures(rootDir, sourcePath);
+  const options = adoptionOptions(rootDir);
+  const manifestPath = path.join(rootDir, ".astro-image-cdn", "manifest.json");
+
+  await assert.rejects(
+    adoptImageVariants(options, { sourcePath, sourceHash, variants: variants.slice(0, 1) }),
+    /Missing adopted variant 640\.webp/,
+  );
+  await assert.rejects(readFile(manifestPath), { code: "ENOENT" });
+  assert.deepEqual(await readdir(path.join(rootDir, ".imagedist")), []);
+
+  await writeFile(sourcePath, "changed source bytes");
+  await assert.rejects(
+    adoptImageVariants(options, { sourcePath, sourceHash, variants }),
+    /Adopted source changed/,
+  );
+  await assert.rejects(readFile(manifestPath), { code: "ENOENT" });
+  assert.deepEqual(await readdir(path.join(rootDir, ".imagedist")), []);
+});
+
+test("rejects adopted outputs with the wrong dimensions or encoding before writing state", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const { sourceHash, variants } = await createAdoptionFixtures(rootDir, sourcePath);
+  await sharp(sourcePath).resize({ width: 128 }).webp().toFile(variants[0].path);
+
+  await assert.rejects(
+    adoptImageVariants(adoptionOptions(rootDir), { sourcePath, sourceHash, variants }),
+    /does not match expected 256x128 webp/,
+  );
+  await assert.rejects(readFile(path.join(rootDir, ".astro-image-cdn", "manifest.json")), { code: "ENOENT" });
+  assert.deepEqual(await readdir(path.join(rootDir, ".imagedist")), []);
+  assert.ok(await stat(variants[0].path), "invalid legacy outputs are only read, never modified or removed");
+
+  await sharp(sourcePath).resize({ width: 256 }).png().toFile(variants[0].path);
+  await assert.rejects(
+    adoptImageVariants(adoptionOptions(rootDir), { sourcePath, sourceHash, variants }),
+    /expected 256x128 webp; received 256x128 png/,
+  );
+  await assert.rejects(readFile(path.join(rootDir, ".astro-image-cdn", "manifest.json")), { code: "ENOENT" });
+  assert.deepEqual(await readdir(path.join(rootDir, ".imagedist")), []);
+});
+
+test("cleans newly adopted files and preserves the old manifest after a state-read failure", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const { sourceHash, variants } = await createAdoptionFixtures(rootDir, sourcePath);
+  const cacheDir = path.join(rootDir, ".astro-image-cdn");
+  const manifestPath = path.join(cacheDir, "manifest.json");
+  const oldManifest = JSON.stringify({ version: 2, images: { prior: { source: "prior" } } }, null, 2) + "\n";
+  await mkdir(cacheDir, { recursive: true });
+  await writeFile(manifestPath, oldManifest);
+  await mkdir(path.join(cacheDir, "cache.json"));
+
+  await assert.rejects(
+    adoptImageVariants(adoptionOptions(rootDir), { sourcePath, sourceHash, variants }),
+    /cache\.json/,
+  );
+  assert.equal(await readFile(manifestPath, "utf8"), oldManifest);
+  for (const width of [256, 640]) {
+    const fingerprintPrefix = await createHash("sha256").update(`${sourceHash}\0${JSON.stringify({
+      widths: [256, 640, 828],
+      formats: ["webp"],
+      quality: 75,
+      transformVersion: 3,
+      sharpVersion: sharp.versions.sharp,
+      libvipsVersion: sharp.versions.vips,
+      dangerouslyProcessSVG: false,
+      includeSourceFormat: false,
+      includeNativeWidth: false,
+      autoRotate: false,
+    })}`).digest("hex");
+    await assert.rejects(stat(path.join(rootDir, ".imagedist", fingerprintPrefix.slice(0, 2), `${fingerprintPrefix}_${width}.webp`)), { code: "ENOENT" });
+  }
+  assert.ok(await stat(variants[0].path), "the legacy source variant must not be removed");
 });
 
 test("fresh output does not contain a public manifest", async (t) => {

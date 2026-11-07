@@ -65,13 +65,16 @@ With this option, `astro dev` installs the image service and local asset route, 
 | `sources` | `["src"]` | Project-root-relative directories from which imported local images may be requested. No startup pre-scan is performed. |
 | `outputDir` | `".imagedist"` | Persistent generated variants, relative to the project root. |
 | `cacheDir` | `".astro-image-cdn"` | Private manifest and incremental fingerprints, relative to the project root. |
-| `widths` | `[256, 640, 828, 1080, 1200, 1920, 2048]` | Requested widths; each source's native width is also generated. Values above the source width are omitted. |
+| `widths` | `[256, 640, 828, 1080, 1200, 1920, 2048]` | Requested widths. Values above the source width are omitted. |
 | `formats` | `["avif", "webp"]` | Output encodings generated for every selected width. Supported: `avif`, `webp`, `jpeg`, `png`. |
 | `quality` | `75` | Sharp encoder quality from 1 to 100. |
+| `includeSourceFormat` | `true` | Also generate each supported source-native format. Set `false` for only the formats listed in `formats`. |
+| `includeNativeWidth` | `true` | Also generate the source's native width when it is not already in `widths`. |
+| `autoRotate` | `true` | Apply EXIF orientation before resizing. Set `false` to preserve the source's stored pixel orientation and dimensions. |
 | `concurrency` | `4` | Maximum number of source images processed at once. |
 | `devOnly` | `false` | Install the integration only for `astro dev`; other Astro commands retain their configured image service. |
 
-Configured formats are generated alongside the source's native raster format (when supported). Astro 7.4's default output for raster images is WebP, independent of the order in `formats`; include `webp` or request a configured format explicitly. If the default or an explicit format is unavailable, the service reports which format needs to be added. For a custom `widths` list, include the widths used by your native image components. For a requested width between generated sizes, the service selects the next available variant, capped at the source's native width.
+Configured formats are generated alongside the source's native raster format when `includeSourceFormat` is enabled (the default). With it disabled, only `formats` are generated. Astro 7.4's default output for raster images is WebP, independent of the order in `formats`; include `webp` or request a configured format explicitly. If the default or an explicit format is unavailable, the service reports which format needs to be added. `widths` are emitted only when they are no wider than the source. The native width is additionally emitted only when `includeNativeWidth` is enabled; if it is already listed in `widths`, it is naturally generated once. For a requested width between generated sizes, the service selects the next available variant, capped at the source's native width.
 
 Animated or multi-page sources are rejected rather than silently flattened to a still frame, including GIF, WebP, AVIF sequences, and multi-page TIFF. Convert them to a static image or exclude them from the configured source directories.
 
@@ -90,6 +93,36 @@ Image identity is the project-relative file path; no frontmatter, YAML sidecars,
 - Warm runs re-hash source bytes but skip Sharp transformations when the fingerprint and every expected output still match.
 - Old content-addressed files are intentionally retained. Request-driven Astro processing preserves unrelated manifest entries; an explicit standalone `processImages()` run reconciles the manifest with the files found under its source directories. Neither mode deletes historical output files.
 - Astro's `dist/` remains Astro-owned; this package does not copy into, clean, or deploy it.
+
+### Adopting existing variants
+
+Migration scripts can use `adoptImageVariants()` to copy already-encoded files into the package's current fingerprint-based paths without running Sharp's encoders. Pass the current processor options and only technical source/output information; the helper does not read application metadata, YAML, or slugs:
+
+```js
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { adoptImageVariants } from "@all-the.rest/astro-image-cdn";
+
+const sourcePath = "src/images/photo.jpg";
+const sourceHash = createHash("sha256").update(await readFile(sourcePath)).digest("hex");
+await adoptImageVariants({
+  rootDir: process.cwd(),
+  widths: [256, 640, 828, 1080, 1200, 1920, 2048],
+  formats: ["webp"],
+  includeSourceFormat: false,
+  includeNativeWidth: false,
+  autoRotate: false,
+}, {
+  sourcePath,
+  sourceHash,
+  variants: [
+    { path: ".legacy-images/photo_256.webp", width: 256, format: "webp" },
+    { path: ".legacy-images/photo_640.webp", width: 640, format: "webp" },
+  ],
+});
+```
+
+The helper verifies the current source hash and each required output's actual format and dimensions before writing. It requires the complete variant set implied by the options; extras (such as legacy native-width files) are ignored. Outputs are atomically written under `outputDir`, and the private manifest/cache are updated only after validation. Repeated calls reuse matching targets; failures leave the prior manifest and existing outputs untouched, and old source variants are never removed. Supply the source hash recorded when the existing outputs were produced so a changed source cannot accidentally adopt stale files.
 
 ## API
 

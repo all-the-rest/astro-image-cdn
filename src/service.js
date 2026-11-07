@@ -375,8 +375,11 @@ const service = {
       throw new Error(`astro-image-cdn has unsupported configured output format(s): ${invalidFormats.join(", ")}. Supported output formats are avif, webp, jpeg, or png.`);
     }
     const format = normalizeFormat(options.format ?? defaultOutputFormat(options));
-    const isSourceFormat = sourceFormat === format && ["avif", "webp", "jpeg", "png", "svg"].includes(format);
-    if (typeof options.src !== "string" && !configuredFormats.includes(format) && !isSourceFormat) {
+    const isSafeSvgPassThrough = sourceFormat === "svg" && format === "svg" && !config.dangerouslyProcessSVG;
+    const isSourceFormat = sourceFormat === format
+      && ["avif", "webp", "jpeg", "png", "svg"].includes(format)
+      && config.includeSourceFormat !== false;
+    if (typeof options.src !== "string" && !configuredFormats.includes(format) && !isSourceFormat && !isSafeSvgPassThrough) {
       if (format === "webp" && options.format == null) {
         throw new Error('Astro 7.4 defaults raster images to "webp", but "webp" is not configured. Add "webp" to astroImageCdn({ formats }) or set an explicit configured format on the image.');
       }

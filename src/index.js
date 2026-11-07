@@ -111,6 +111,9 @@ export default function astroImageCdn(options) {
           widths: options.widths ?? DEFAULT_IMAGE_WIDTHS,
           formats: options.formats ?? DEFAULT_IMAGE_FORMATS,
           quality: options.quality ?? 75,
+          includeSourceFormat: options.includeSourceFormat ?? true,
+          includeNativeWidth: options.includeNativeWidth ?? true,
+          autoRotate: options.autoRotate ?? true,
           concurrency: options.concurrency ?? 4,
           dangerouslyProcessSVG: config.image?.dangerouslyProcessSVG ?? false,
           devMode,
@@ -150,4 +153,4 @@ export default function astroImageCdn(options) {
   };
 }
 
-export { processImages } from "./processor.js";
+export { adoptImageVariants, processImages } from "./processor.js";

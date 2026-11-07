@@ -7,12 +7,18 @@ interface AstroImageCdnBaseOptions {
   outputDir?: string;
   /** Incremental state directory, relative to the project root. Defaults to ".astro-image-cdn". */
   cacheDir?: string;
-  /** Widths generated in addition to each source image's native width. */
+  /** Configured widths; values above the source width are omitted. */
   widths?: number[];
   /** Output formats generated for every source. Defaults to ["avif", "webp"]. */
   formats?: Array<"avif" | "webp" | "jpeg" | "png">;
   /** Encoder quality from 1 to 100. Defaults to 75. */
   quality?: number;
+  /** Also generate a supported source-native format. Defaults to true. */
+  includeSourceFormat?: boolean;
+  /** Also generate the source's native width when it is not configured. Defaults to true. */
+  includeNativeWidth?: boolean;
+  /** Apply EXIF orientation before resizing. Defaults to true. */
+  autoRotate?: boolean;
   /** Maximum number of images processed concurrently. Defaults to 4. */
   concurrency?: number;
 }
@@ -47,6 +53,33 @@ export interface ProcessImagesResult {
   legacyPublicManifestPath?: string;
 }
 
+export interface AdoptImageVariant {
+  /** Existing encoded output path; relative paths are resolved from rootDir. */
+  path: string;
+  width: number;
+  format: "avif" | "webp" | "jpeg" | "png" | "svg";
+}
+
+export interface AdoptImageVariantsInput {
+  /** Existing source path, relative to rootDir or absolute. */
+  sourcePath: string;
+  /** SHA-256 of the source bytes when the existing variants were produced. */
+  sourceHash: string;
+  /** Existing variants to adopt; every output required by the options must be supplied. */
+  variants: AdoptImageVariant[];
+}
+
+export interface AdoptImageVariantsResult {
+  fingerprint: string;
+  adopted: number;
+  reused: number;
+  manifestPath: string;
+}
+
 export default function astroImageCdn(options: AstroImageCdnOptions): AstroIntegration;
 
 export declare function processImages(options: ProcessImagesOptions): Promise<ProcessImagesResult>;
+export declare function adoptImageVariants(
+  options: ProcessImagesOptions,
+  input: AdoptImageVariantsInput,
+): Promise<AdoptImageVariantsResult>;
