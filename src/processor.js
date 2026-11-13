@@ -10,6 +10,7 @@ const DEFAULT_WIDTHS = [256, 640, 828, 1080, 1200, 1920, 2048];
 const DEFAULT_FORMATS = ["avif", "webp"];
 const DEFAULT_WEBP_EFFORT = 4;
 const DEFAULT_AVIF_EFFORT = 4;
+const DEFAULT_VERIFICATION = "stat";
 const SUPPORTED_FORMATS = new Set(["avif", "webp", "jpeg", "png", "svg"]);
 const IMAGE_EXTENSIONS = new Set([
   ".avif", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".svg", ".tif", ".tiff", ".webp",
@@ -129,6 +130,14 @@ export function resolveEncoderEfforts(options) {
   return { webpEffort, avifEffort };
 }
 
+export function resolveVerification(options) {
+  const verification = options.verification ?? DEFAULT_VERIFICATION;
+  if (verification !== "stat" && verification !== "digest") {
+    throw new TypeError(`verification must be "stat" or "digest"; received ${JSON.stringify(verification)}`);
+  }
+  return verification;
+}
+
 function heightMatchesExpected(expected, actual) {
   return Number.isSafeInteger(actual) && Math.abs(actual - expected) <= 1;
 }
@@ -147,6 +156,7 @@ function resolveOptions(options) {
   const formats = [...new Set((options.formats ?? DEFAULT_FORMATS).map(normalizeFormat))];
   const quality = options.quality ?? 75;
   const { webpEffort, avifEffort } = resolveEncoderEfforts(options);
+  const verification = resolveVerification(options);
   const concurrency = options.concurrency ?? 4;
   const dangerouslyProcessSVG = options.dangerouslyProcessSVG ?? false;
   const includeSourceFormat = options.includeSourceFormat ?? true;
@@ -181,6 +191,7 @@ function resolveOptions(options) {
     quality,
     webpEffort,
     avifEffort,
+    verification,
     concurrency,
     dangerouslyProcessSVG,
     includeSourceFormat,
@@ -335,9 +346,37 @@ function expectedVariants(fingerprint, dimensions, sourceFormat, options) {
     })));
 }
 
-async function readMatchingVariant(outputDir, variant) {
-  if (!variant || typeof variant.file !== "string" || !/^[a-f0-9]{64}$/.test(variant.digest ?? "")) return undefined;
-  const filePath = path.resolve(outputDir, variant.file);
+function hasValidVariantIdentity(variant) {
+  return Boolean(variant)
+    && typeof variant.file === "string"
+    && /^[a-f0-9]{64}$/.test(variant.digest ?? "");
+}
+
+async function fileStat(filePath) {
+  const info = await lstat(filePath, { bigint: true });
+  if (!info.isFile() || info.isSymbolicLink()) return undefined;
+  return { size: Number(info.size), mtimeNs: info.mtimeNs.toString() };
+}
+
+async function sourceFileStat(filePath) {
+  try {
+    return await fileStat(filePath);
+  } catch (error) {
+    if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
+    throw error;
+  }
+}
+
+function matchesRecordedStat(variant, info) {
+  return Number.isSafeInteger(variant?.size)
+    && variant.size === info.size
+    && typeof variant?.mtimeNs === "string"
+    && variant.mtimeNs === info.mtimeNs;
+}
+
+async function inspectVariantFile(outputDir, file) {
+  if (typeof file !== "string") return undefined;
+  const filePath = path.resolve(outputDir, file);
   if (!isInside(outputDir, filePath) || filePath === outputDir) return undefined;
 
   try {
@@ -349,33 +388,49 @@ async function readMatchingVariant(outputDir, variant) {
       const directoryInfo = await lstat(directory);
       if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) return undefined;
     }
-    const fileInfo = await lstat(filePath);
-    if (!fileInfo.isFile() || fileInfo.isSymbolicLink()) return undefined;
-    const buffer = await readFile(filePath);
-    return digest(buffer) === variant.digest ? buffer : undefined;
+    const info = await fileStat(filePath);
+    return info ? { filePath, ...info } : undefined;
   } catch (error) {
     if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
     throw error;
   }
 }
 
+async function readMatchingVariant(outputDir, variant) {
+  if (!hasValidVariantIdentity(variant)) return undefined;
+  const inspected = await inspectVariantFile(outputDir, variant.file);
+  if (!inspected) return undefined;
+  const buffer = await readFile(inspected.filePath);
+  return digest(buffer) === variant.digest ? { buffer, ...inspected } : undefined;
+}
+
 async function variantMatches(outputDir, variant) {
   return (await readMatchingVariant(outputDir, variant)) !== undefined;
 }
 
-async function verifiedVariantHeight(outputDir, variant, expectedVariant) {
-  const buffer = await readMatchingVariant(outputDir, variant);
-  if (!buffer) return undefined;
+async function verifyVariant(outputDir, variant, expectedVariant, verification) {
+  if (!hasValidVariantIdentity(variant) || !expectedVariant) return undefined;
+  if (verification === "stat") {
+    const inspected = await inspectVariantFile(outputDir, variant.file);
+    if (inspected
+      && matchesRecordedStat(variant, inspected)
+      && heightMatchesExpected(expectedVariant.height, variant.height)) {
+      return { ...variant, size: inspected.size, mtimeNs: inspected.mtimeNs };
+    }
+  }
+
+  const matched = await readMatchingVariant(outputDir, variant);
+  if (!matched) return undefined;
   let metadata;
   try {
-    metadata = await sharp(buffer, { failOn: "none" }).metadata();
+    metadata = await sharp(matched.buffer, { failOn: "none" }).metadata();
   } catch {
     return undefined;
   }
   if (normalizeVariantFormat(metadata) !== expectedVariant.format
     || metadata.width !== expectedVariant.width
     || !heightMatchesExpected(expectedVariant.height, metadata.height)) return undefined;
-  return metadata.height;
+  return { ...variant, height: metadata.height, size: matched.size, mtimeNs: matched.mtimeNs };
 }
 
 function variantKey(variant) {
@@ -386,7 +441,7 @@ function hasCompleteVariantSet(actual, expected) {
   if (!Array.isArray(actual) || actual.length !== expected.length) return false;
   const byKey = new Map();
   for (const variant of actual) {
-    if (!variant || !/^[a-f0-9]{64}$/.test(variant.digest ?? "")) return false;
+    if (!hasValidVariantIdentity(variant)) return false;
     const key = variantKey(variant);
     if (byKey.has(key)) return false;
     byKey.set(key, variant);
@@ -397,15 +452,15 @@ function hasCompleteVariantSet(actual, expected) {
   });
 }
 
-async function verifiedOutputVariants(outputDir, actual, expected) {
+async function verifiedOutputVariants(outputDir, actual, expected, verification) {
   if (!hasCompleteVariantSet(actual, expected)) return undefined;
   const actualByKey = new Map(actual.map((variant) => [variantKey(variant), variant]));
   const verified = [];
   for (const expectedVariant of expected) {
     const variant = actualByKey.get(variantKey(expectedVariant));
-    const height = await verifiedVariantHeight(outputDir, variant, expectedVariant);
-    if (height === undefined) return undefined;
-    verified.push({ ...variant, height });
+    const verifiedVariant = await verifyVariant(outputDir, variant, expectedVariant, verification);
+    if (!verifiedVariant) return undefined;
+    verified.push(verifiedVariant);
   }
   return verified;
 }
@@ -414,7 +469,7 @@ function carryForwardVariantDigests(expected, previous) {
   const previousByKey = new Map();
   if (Array.isArray(previous)) {
     for (const variant of previous) {
-      if (variant && /^[a-f0-9]{64}$/.test(variant.digest ?? "")) {
+      if (hasValidVariantIdentity(variant)) {
         previousByKey.set(variantKey(variant), variant);
       }
     }
@@ -423,7 +478,14 @@ function carryForwardVariantDigests(expected, previous) {
   return expected.map((variant) => {
     const previousVariant = previousByKey.get(variantKey(variant));
     if (previousVariant?.file === variant.file && heightMatchesExpected(variant.height, previousVariant.height)) {
-      return { ...variant, height: previousVariant.height, digest: previousVariant.digest };
+      return {
+        ...variant,
+        height: previousVariant.height,
+        digest: previousVariant.digest,
+        ...(Number.isSafeInteger(previousVariant.size) && typeof previousVariant.mtimeNs === "string"
+          ? { size: previousVariant.size, mtimeNs: previousVariant.mtimeNs }
+          : {}),
+      };
     }
     return variant;
   });
@@ -459,7 +521,14 @@ async function ensureVariantDirectory(outputDir, file) {
 async function writeVariant(buffer, filePath, variant, options, expectedHeight) {
   if (variant.format === "svg") {
     await atomicWrite(filePath, buffer);
-    return { digest: digest(buffer), width: variant.width, height: expectedHeight };
+    const fileInfo = await lstat(filePath, { bigint: true });
+    return {
+      digest: digest(buffer),
+      width: variant.width,
+      height: expectedHeight,
+      size: Number(fileInfo.size),
+      mtimeNs: fileInfo.mtimeNs.toString(),
+    };
   }
   const image = sharp(buffer, { failOn: "none" });
   if (options.autoRotate) image.rotate();
@@ -471,7 +540,14 @@ async function writeVariant(buffer, filePath, variant, options, expectedHeight) 
 
   const { data, info } = await image.toBuffer({ resolveWithObject: true });
   await atomicWrite(filePath, data);
-  return { digest: digest(data), width: info.width, height: info.height };
+  const fileInfo = await lstat(filePath, { bigint: true });
+  return {
+    digest: digest(data),
+    width: info.width,
+    height: info.height,
+    size: Number(fileInfo.size),
+    mtimeNs: fileInfo.mtimeNs.toString(),
+  };
 }
 
 async function mapConcurrent(items, concurrency, callback) {
@@ -491,7 +567,7 @@ async function mapConcurrent(items, concurrency, callback) {
 
 async function processImagesFromFiles(rawOptions, requestedFiles) {
   const options = resolveOptions(rawOptions);
-  const { rootDir, sourceDirectories, publicDir, concurrency, autoRotate } = options;
+  const { rootDir, sourceDirectories, publicDir, concurrency, autoRotate, verification } = options;
   let { outputDir, cacheDir } = options;
   const reportedManifestPath = path.join(cacheDir, "manifest.json");
   const canonicalRoot = await canonicalizePath(rootDir);
@@ -592,15 +668,36 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
 
     const results = await mapConcurrent(files, concurrency, async (sourcePath) => {
       const relativePath = normalizeRelativePath(path.relative(rootDir, sourcePath));
-      const sourceBuffer = await readFile(sourcePath);
-      const sourceHash = digest(sourceBuffer);
-      const fingerprint = digest(`${sourceHash}\0${pipeline}`);
       const cacheEntry = oldCache.sources?.[relativePath];
       const previousEntry = oldManifest.images?.[relativePath];
-      const dimensions = await imageMetadata(sourceBuffer, sourcePath, autoRotate);
-      const sourceFormat = normalizeFormat(dimensions.format);
-      const expected = expectedVariants(fingerprint, dimensions, sourceFormat, options);
-      const expectedByKey = new Map(expected.map((variant) => [variantKey(variant), variant]));
+      let sourceInfo = await sourceFileStat(sourcePath);
+      const canTrustSourceStat = verification === "stat"
+        && sourceInfo
+        && cacheEntry?.sourceSize === sourceInfo.size
+        && cacheEntry?.sourceMtimeNs === sourceInfo.mtimeNs
+        && cacheEntry?.autoRotate === autoRotate
+        && previousEntry
+        && typeof previousEntry.sourceHash === "string"
+        && Number.isSafeInteger(previousEntry.width) && previousEntry.width > 0
+        && Number.isSafeInteger(previousEntry.height) && previousEntry.height > 0
+        && typeof previousEntry.sourceFormat === "string";
+
+      let sourceBuffer;
+      let sourceHash;
+      let dimensions;
+      if (canTrustSourceStat) {
+        sourceHash = previousEntry.sourceHash;
+        dimensions = { width: previousEntry.width, height: previousEntry.height, format: previousEntry.sourceFormat };
+      } else {
+        sourceBuffer = await readFile(sourcePath);
+        sourceHash = digest(sourceBuffer);
+        dimensions = await imageMetadata(sourceBuffer, sourcePath, autoRotate);
+        sourceInfo = await sourceFileStat(sourcePath) ?? sourceInfo;
+      }
+
+      let fingerprint = digest(`${sourceHash}\0${pipeline}`);
+      let expected = expectedVariants(fingerprint, dimensions, normalizeFormat(dimensions.format), options);
+      let expectedByKey = new Map(expected.map((variant) => [variantKey(variant), variant]));
 
       const canReuse = cacheEntry?.fingerprint === fingerprint
         && previousEntry?.fingerprint === fingerprint
@@ -608,9 +705,24 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
         && previousEntry.width === dimensions.width
         && previousEntry.height === dimensions.height
         && previousEntry.sourceFormat === dimensions.format;
-      const verifiedVariants = canReuse
-        ? await verifiedOutputVariants(outputDir, previousEntry.variants, expected)
+      let verifiedVariants = canReuse
+        ? await verifiedOutputVariants(outputDir, previousEntry.variants, expected, verification)
         : undefined;
+
+      if (verifiedVariants === undefined && sourceBuffer === undefined) {
+        sourceBuffer = await readFile(sourcePath);
+        sourceInfo = await sourceFileStat(sourcePath) ?? sourceInfo;
+        const actualHash = digest(sourceBuffer);
+        if (actualHash !== sourceHash) {
+          sourceHash = actualHash;
+          dimensions = await imageMetadata(sourceBuffer, sourcePath, autoRotate);
+          fingerprint = digest(`${sourceHash}\0${pipeline}`);
+          expected = expectedVariants(fingerprint, dimensions, normalizeFormat(dimensions.format), options);
+          expectedByKey = new Map(expected.map((variant) => [variantKey(variant), variant]));
+          verifiedVariants = undefined;
+        }
+      }
+
       const isWarm = verifiedVariants !== undefined;
       let variants;
       if (isWarm) {
@@ -620,9 +732,9 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
         variants = carryForwardVariantDigests(expected, previousEntry?.variants);
         const missingVariants = [];
         for (const variant of variants) {
-          const height = await verifiedVariantHeight(outputDir, variant, expectedByKey.get(variantKey(variant)));
-          if (height === undefined) missingVariants.push(variant);
-          else variant.height = height;
+          const verified = await verifyVariant(outputDir, variant, expectedByKey.get(variantKey(variant)), "digest");
+          if (!verified) missingVariants.push(variant);
+          else Object.assign(variant, verified);
         }
         await mapConcurrent(missingVariants, Math.min(concurrency, 4), async (variant) => {
           const targetPath = await ensureVariantDirectory(outputDir, variant.file);
@@ -631,14 +743,14 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
           if (output.width !== expectedVariant.width || !heightMatchesExpected(expectedVariant.height, output.height)) {
             throw new Error(`Generated ${variant.width}.${variant.format} has unexpected dimensions ${output.width}x${output.height}`);
           }
-          variant.height = output.height;
-          variant.digest = output.digest;
+          Object.assign(variant, output);
         });
         processed++;
       }
 
       return {
         relativePath,
+        sourceInfo,
         entry: {
           source: relativePath,
           fingerprint,
@@ -651,9 +763,13 @@ async function processImagesFromFiles(rawOptions, requestedFiles) {
       };
     });
 
-    for (const { relativePath, entry } of results) {
+    for (const { relativePath, entry, sourceInfo } of results) {
       manifest.images[relativePath] = entry;
-      cache.sources[relativePath] = { fingerprint: entry.fingerprint };
+      cache.sources[relativePath] = {
+        fingerprint: entry.fingerprint,
+        ...(sourceInfo ? { sourceSize: sourceInfo.size, sourceMtimeNs: sourceInfo.mtimeNs } : {}),
+        autoRotate,
+      };
     }
 
     const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
@@ -681,7 +797,7 @@ export async function adoptImageVariants(rawOptions, adoption) {
     throw new TypeError("adoptImageVariants requires a variants array");
   }
 
-  const { rootDir, sourceDirectories, publicDir } = options;
+  const { rootDir, sourceDirectories, publicDir, verification, autoRotate } = options;
   const sourcePath = path.resolve(rootDir, adoption.sourcePath);
   const relativePath = path.relative(rootDir, sourcePath);
   if (relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
@@ -744,29 +860,107 @@ export async function adoptImageVariants(rawOptions, adoption) {
   const releaseLocks = await acquireWriterLocks([outputDir, cacheDir]);
   const createdPaths = [];
   try {
-    const sourceBuffer = await readFile(sourcePath);
-    const sourceHash = digest(sourceBuffer);
-    if (sourceHash !== adoption.sourceHash) {
-      throw new Error(`Adopted source changed: expected SHA-256 ${adoption.sourceHash}, received ${sourceHash} for ${sourcePath}`);
+    const manifestPath = path.join(cacheDir, "manifest.json");
+    const cachePath = path.join(cacheDir, "cache.json");
+    const [oldManifest, oldCache] = await Promise.all([
+      readJson(manifestPath, { version: MANIFEST_VERSION, images: {} }),
+      readJson(cachePath, { version: CACHE_VERSION, sources: {} }),
+    ]);
+    const manifest = {
+      version: MANIFEST_VERSION,
+      images: oldManifest.images && typeof oldManifest.images === "object" ? { ...oldManifest.images } : {},
+    };
+    const cache = {
+      version: CACHE_VERSION,
+      sources: oldCache.sources && typeof oldCache.sources === "object" ? { ...oldCache.sources } : {},
+    };
+    const key = normalizeRelativePath(relativePath);
+    const previousEntry = manifest.images[key];
+    const cacheEntry = cache.sources[key];
+    let sourceInfo = await sourceFileStat(sourcePath);
+    const canTrustPrevious = verification === "stat"
+      && sourceInfo
+      && cacheEntry?.sourceSize === sourceInfo.size
+      && cacheEntry?.sourceMtimeNs === sourceInfo.mtimeNs
+      && cacheEntry?.autoRotate === autoRotate
+      && previousEntry
+      && previousEntry.sourceHash === adoption.sourceHash
+      && Number.isSafeInteger(previousEntry.width) && previousEntry.width > 0
+      && Number.isSafeInteger(previousEntry.height) && previousEntry.height > 0
+      && typeof previousEntry.sourceFormat === "string";
+
+    let sourceHash;
+    let dimensions;
+    if (canTrustPrevious) {
+      sourceHash = adoption.sourceHash;
+      dimensions = { width: previousEntry.width, height: previousEntry.height, format: previousEntry.sourceFormat };
+    } else {
+      const sourceBuffer = await readFile(sourcePath);
+      sourceHash = digest(sourceBuffer);
+      if (sourceHash !== adoption.sourceHash) {
+        throw new Error(`Adopted source changed: expected SHA-256 ${adoption.sourceHash}, received ${sourceHash} for ${sourcePath}`);
+      }
+      dimensions = await imageMetadata(sourceBuffer, sourcePath, autoRotate);
+      sourceInfo = await sourceFileStat(sourcePath) ?? sourceInfo;
     }
 
-    const dimensions = await imageMetadata(sourceBuffer, sourcePath, options.autoRotate);
-    const sourceFormat = normalizeFormat(dimensions.format);
     const fingerprint = digest(`${sourceHash}\0${pipelineSettings(options)}`);
-    const expected = expectedVariants(fingerprint, dimensions, sourceFormat, options);
+    const expected = expectedVariants(fingerprint, dimensions, normalizeFormat(dimensions.format), options);
     const supplied = new Map();
     for (const variant of adoption.variants) {
-      const key = variantKey({ width: variant.width, format: normalizeFormat(variant.format) });
-      if (supplied.has(key)) throw new Error(`Duplicate adopted variant for ${variant.width}.${normalizeFormat(variant.format)}`);
-      supplied.set(key, variant);
+      const variantKeyValue = variantKey({ width: variant.width, format: normalizeFormat(variant.format) });
+      if (supplied.has(variantKeyValue)) throw new Error(`Duplicate adopted variant for ${variant.width}.${normalizeFormat(variant.format)}`);
+      supplied.set(variantKeyValue, variant);
+    }
+    for (const expectedVariant of expected) {
+      if (!supplied.has(variantKey(expectedVariant))) {
+        throw new Error(`Missing adopted variant ${expectedVariant.width}.${expectedVariant.format} for ${relativePath}`);
+      }
+    }
+
+    const persistState = async () => {
+      const manifestChanged = JSON.stringify(manifest.images[key]) !== JSON.stringify(oldManifest.images?.[key]);
+      const cacheChanged = JSON.stringify(cache.sources[key]) !== JSON.stringify(oldCache.sources?.[key]);
+      if (!manifestChanged && !cacheChanged) return;
+
+      const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
+      const cacheJson = `${JSON.stringify(cache, null, 2)}\n`;
+      let oldCacheText;
+      if (cacheChanged) {
+        oldCacheText = await readFile(cachePath, "utf8").catch((error) => error.code === "ENOENT" ? undefined : Promise.reject(error));
+        await atomicWrite(cachePath, cacheJson);
+      }
+      try {
+        if (manifestChanged) await atomicWrite(manifestPath, manifestJson);
+      } catch (error) {
+        if (cacheChanged) {
+          if (oldCacheText === undefined) await unlink(cachePath).catch(() => {});
+          else await atomicWrite(cachePath, oldCacheText).catch(() => {});
+        }
+        throw error;
+      }
+    };
+
+    if (canTrustPrevious
+      && previousEntry.fingerprint === fingerprint
+      && cacheEntry?.fingerprint === fingerprint) {
+      const verifiedVariants = await verifiedOutputVariants(outputDir, previousEntry.variants, expected, verification);
+      if (verifiedVariants) {
+        manifest.images[key] = { ...previousEntry, variants: verifiedVariants };
+        cache.sources[key] = {
+          fingerprint,
+          sourceSize: sourceInfo.size,
+          sourceMtimeNs: sourceInfo.mtimeNs,
+          autoRotate,
+        };
+        await persistState();
+        return { fingerprint, adopted: expected.length, reused: expected.length, manifestPath };
+      }
     }
 
     const validated = [];
     for (const expectedVariant of expected) {
       const suppliedVariant = supplied.get(variantKey(expectedVariant));
-      if (!suppliedVariant) {
-        throw new Error(`Missing adopted variant ${expectedVariant.width}.${expectedVariant.format} for ${relativePath}`);
-      }
       const inputPath = path.resolve(rootDir, suppliedVariant.path);
       const inputInfo = await lstat(inputPath);
       if (!inputInfo.isFile() || inputInfo.isSymbolicLink()) {
@@ -795,15 +989,20 @@ export async function adoptImageVariants(rawOptions, adoption) {
       });
     }
 
-    const outputVariants = validated.map(({ buffer, ...variant }) => variant);
     const writeTargets = [];
     for (const variant of validated) {
       const targetPath = await ensureVariantDirectory(outputDir, variant.file);
       try {
         const info = await lstat(targetPath);
-        if (!info.isFile() || info.isSymbolicLink() || !await variantMatches(outputDir, variant)) {
+        if (!info.isFile() || info.isSymbolicLink()) {
           throw new Error(`Refusing to replace an existing non-matching adopted output: ${targetPath}`);
         }
+        const matched = await readMatchingVariant(outputDir, variant);
+        if (!matched) {
+          throw new Error(`Refusing to replace an existing non-matching adopted output: ${targetPath}`);
+        }
+        variant.size = matched.size;
+        variant.mtimeNs = matched.mtimeNs;
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
         writeTargets.push({ targetPath, variant });
@@ -811,32 +1010,20 @@ export async function adoptImageVariants(rawOptions, adoption) {
     }
 
     for (const { targetPath, variant } of writeTargets) {
-      const sourceVariant = validated.find((candidate) => candidate.file === variant.file);
-      await atomicWrite(targetPath, sourceVariant.buffer);
+      await atomicWrite(targetPath, variant.buffer);
+      const fileInfo = await lstat(targetPath, { bigint: true });
+      variant.size = Number(fileInfo.size);
+      variant.mtimeNs = fileInfo.mtimeNs.toString();
       createdPaths.push({ targetPath, variant });
     }
 
-    if (digest(await readFile(sourcePath)) !== sourceHash) {
+    if ((!canTrustPrevious || writeTargets.length > 0) && digest(await readFile(sourcePath)) !== sourceHash) {
       throw new Error(`Adopted source changed during migration: ${sourcePath}`);
     }
 
-    const manifestPath = path.join(cacheDir, "manifest.json");
-    const cachePath = path.join(cacheDir, "cache.json");
-    const [oldManifest, oldCache, oldCacheText] = await Promise.all([
-      readJson(manifestPath, { version: MANIFEST_VERSION, images: {} }),
-      readJson(cachePath, { version: CACHE_VERSION, sources: {} }),
-      readFile(cachePath, "utf8").catch((error) => error.code === "ENOENT" ? undefined : Promise.reject(error)),
-    ]);
-    const manifest = {
-      version: MANIFEST_VERSION,
-      images: oldManifest.images && typeof oldManifest.images === "object" ? { ...oldManifest.images } : {},
-    };
-    const cache = {
-      version: CACHE_VERSION,
-      sources: oldCache.sources && typeof oldCache.sources === "object" ? { ...oldCache.sources } : {},
-    };
-    manifest.images[normalizeRelativePath(relativePath)] = {
-      source: normalizeRelativePath(relativePath),
+    const outputVariants = validated.map(({ buffer, ...variant }) => variant);
+    manifest.images[key] = {
+      source: key,
       fingerprint,
       sourceHash,
       sourceFormat: dimensions.format,
@@ -844,22 +1031,12 @@ export async function adoptImageVariants(rawOptions, adoption) {
       height: dimensions.height,
       variants: outputVariants,
     };
-    cache.sources[normalizeRelativePath(relativePath)] = { fingerprint };
-    const manifestJson = `${JSON.stringify(manifest, null, 2)}\n`;
-    const cacheJson = `${JSON.stringify(cache, null, 2)}\n`;
-    const manifestChanged = manifestJson !== `${JSON.stringify(oldManifest, null, 2)}\n`;
-    const cacheChanged = cacheJson !== `${JSON.stringify(oldCache, null, 2)}\n`;
-
-    if (cacheChanged) await atomicWrite(cachePath, cacheJson);
-    try {
-      if (manifestChanged) await atomicWrite(manifestPath, manifestJson);
-    } catch (error) {
-      if (cacheChanged) {
-        if (oldCacheText === undefined) await unlink(cachePath).catch(() => {});
-        else await atomicWrite(cachePath, oldCacheText).catch(() => {});
-      }
-      throw error;
-    }
+    cache.sources[key] = {
+      fingerprint,
+      ...(sourceInfo ? { sourceSize: sourceInfo.size, sourceMtimeNs: sourceInfo.mtimeNs } : {}),
+      autoRotate,
+    };
+    await persistState();
 
     return {
       fingerprint,

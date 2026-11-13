@@ -7,6 +7,7 @@ const options: AstroImageCdnOptions = {
   formats: ["avif", "webp"],
   webpEffort: 2,
   avifEffort: 7,
+  verification: "stat",
   includeSourceFormat: false,
   includeNativeWidth: false,
   autoRotate: false,
