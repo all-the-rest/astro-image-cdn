@@ -73,6 +73,7 @@ With this option, `astro dev` installs the image service and local asset route, 
 | `includeSourceFormat` | `true` | Also generate each supported source-native format. Set `false` for only the formats listed in `formats`. |
 | `includeNativeWidth` | `true` | Also generate the source's native width when it is not already in `widths`. |
 | `autoRotate` | `true` | Apply EXIF orientation before resizing. Set `false` to preserve the source's stored pixel orientation and dimensions. |
+| `verification` | `"stat"` | Warm-cache verification strategy. `"stat"` trusts recorded size and mtime and avoids reading unchanged sources and outputs. `"digest"` re-hashes every source and output on every run. |
 | `concurrency` | `4` | Maximum number of source images processed at once. |
 | `devOnly` | `false` | Install the integration only for `astro dev`; other Astro commands retain their configured image service. |
 
@@ -91,10 +92,11 @@ Image identity is the project-relative file path; no frontmatter, YAML sidecars,
 ## Persistence and cache behavior
 
 - `sourceHash` is the full lowercase SHA-256 of the original source bytes only; it does not change when transform settings change. A separate transform fingerprint is the SHA-256 of that source identity plus the effective transform policy (widths, formats, quality, encoder effort, orientation/SVG settings), the transform implementation version, and the Sharp/libvips versions.
-- Variant filenames include that fingerprint, width, and format. Each manifest variant stores a SHA-256 digest; warm-cache reuse verifies the digest and rejects symlinks instead of trusting file existence alone.
+- Variant filenames include that fingerprint, width, and format. Each manifest variant stores a SHA-256 digest plus the file's size and nanosecond mtime when it was written; the source cache records the source's size and mtime too. Warm-cache reuse rejects symlinks and non-files.
+- With the default `verification: "stat"`, a warm run compares those recorded size/mtime values. Unchanged sources and variants are not opened or hashed at all; only changed or unrecorded files fall back to SHA-256 and Sharp metadata validation. With `verification: "digest"`, every source and variant is re-read and re-hashed on every run. Content changes that preserve both size and mtime are only detected in `"digest"` mode.
 - Each manifest is checked against the complete set of variants expected for its source and current options, so empty or partial entries trigger repair rather than a false cache hit.
 - The private cache and manifest are updated atomically and only when their contents change. Concurrent native image requests are deduplicated and batched per event-loop turn; batches are serialized through one writer queue, while the configured concurrency controls processing within each batch. A pre-existing `manifest.json` in `outputDir` is detected, reported in the processing result, and warned about when an Astro-requested image or standalone bulk run processes images; it is never modified. Verify its ownership, then manually move it outside public output or remove it before publishing. A filesystem lock allows only one process to write a given output/cache pair; overlapping processes fail with the lock path instead of racing. If a process is interrupted, verify it has stopped and remove any leftover `.astro-image-cdn.lock` file before retrying; the next run can rebuild missing variants.
-- Warm runs re-hash source bytes but skip Sharp transformations when the fingerprint and every expected output still match.
+- Warm runs skip Sharp transformations when the fingerprint and every expected output still match. They also skip source reads when the recorded source stat still matches.
 - Old content-addressed files are intentionally retained. Request-driven Astro processing preserves unrelated manifest entries; an explicit standalone `processImages()` run reconciles the manifest with the files found under its source directories. Neither mode deletes historical output files.
 - Astro's `dist/` remains Astro-owned; this package does not copy into, clean, or deploy it.
 
@@ -126,7 +128,7 @@ await adoptImageVariants({
 });
 ```
 
-The helper verifies the current source hash and each required output's actual format and dimensions before writing. It requires the complete variant set implied by the options; extras (such as legacy native-width files) are ignored. Outputs are atomically written under `outputDir`, and the private manifest/cache are updated only after validation. Repeated calls reuse matching targets; failures leave the prior manifest and existing outputs untouched, and old source variants are never removed. Supply the source hash recorded when the existing outputs were produced so a changed source cannot accidentally adopt stale files.
+The helper verifies the current source hash and each required output's actual format and dimensions before writing. It requires the complete variant set implied by the options; extras (such as legacy native-width files) are ignored. Outputs are atomically written under `outputDir`, and the private manifest/cache are updated only after validation. Under the default `verification: "stat"`, a repeated call whose targets and manifest already match returns without reading the supplied legacy files or copying bytes; `verification: "digest"` re-validates every supplied variant. Failures leave the prior manifest and existing outputs untouched, and old source variants are never removed. Supply the source hash recorded when the existing outputs were produced so a changed source cannot accidentally adopt stale files.
 
 ## API
 

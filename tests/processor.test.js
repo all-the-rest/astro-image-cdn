@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -127,6 +127,92 @@ test("generates content-addressed variants outside dist and reuses warm outputs"
   assert.ok(outputEntries.includes("manifest.json"));
   assert.equal(await readFile(legacyPublicManifest, "utf8"), "legacy public manifest");
   assert.equal(path.relative(path.join(rootDir, "dist"), path.join(rootDir, ".imagedist")).startsWith(".."), true);
+});
+
+test("warm stat verification avoids reading unchanged sources and variants", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const options = {
+    rootDir,
+    widths: [256, 640],
+    formats: ["webp"],
+    includeSourceFormat: false,
+    includeNativeWidth: false,
+  };
+  const first = await processImages(options);
+  assert.equal(first.processed, 1);
+
+  const manifestPath = path.join(rootDir, ".astro-image-cdn", "manifest.json");
+  const cachePath = path.join(rootDir, ".astro-image-cdn", "cache.json");
+  let manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  let cache = JSON.parse(await readFile(cachePath, "utf8"));
+  const entry = manifest.images["src/images/sample.png"];
+  const cacheEntry = cache.sources["src/images/sample.png"];
+  assert.ok(entry.variants.every(({ size, mtimeNs }) => Number.isSafeInteger(size) && typeof mtimeNs === "string"));
+  assert.ok(Number.isSafeInteger(cacheEntry.sourceSize));
+  assert.equal(typeof cacheEntry.sourceMtimeNs, "string");
+  assert.equal(cacheEntry.autoRotate, true);
+
+  // Older manifests and caches are upgraded after one digest verification.
+  for (const variant of entry.variants) {
+    delete variant.size;
+    delete variant.mtimeNs;
+  }
+  delete cacheEntry.sourceSize;
+  delete cacheEntry.sourceMtimeNs;
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeFile(cachePath, `${JSON.stringify(cache, null, 2)}\n`);
+  const upgraded = await processImages(options);
+  assert.equal(upgraded.processed, 0);
+  assert.equal(upgraded.skipped, 1);
+  manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  cache = JSON.parse(await readFile(cachePath, "utf8"));
+  assert.ok(manifest.images["src/images/sample.png"].variants.every(({ size, mtimeNs }) => Number.isSafeInteger(size) && typeof mtimeNs === "string"));
+  assert.ok(Number.isSafeInteger(cache.sources["src/images/sample.png"].sourceSize));
+
+  const variantPaths = manifest.images["src/images/sample.png"].variants.map(({ file }) => path.join(rootDir, ".imagedist", file));
+  const beforeStats = await Promise.all(variantPaths.map((filePath) => stat(filePath)));
+  await chmod(sourcePath, 0o000);
+  await Promise.all(variantPaths.map((filePath) => chmod(filePath, 0o000)));
+  const second = await processImages(options);
+  assert.equal(second.processed, 0);
+  assert.equal(second.skipped, 1);
+  const afterStats = await Promise.all(variantPaths.map((filePath) => stat(filePath)));
+  assert.deepEqual(afterStats.map(({ mtimeMs }) => mtimeMs), beforeStats.map(({ mtimeMs }) => mtimeMs));
+});
+
+test("digest verification repairs same-size corruption with a restored mtime", async (t) => {
+  const { rootDir } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const options = {
+    rootDir,
+    widths: [256],
+    formats: ["webp"],
+    includeSourceFormat: false,
+    includeNativeWidth: false,
+  };
+  await processImages(options);
+  const manifestPath = path.join(rootDir, ".astro-image-cdn", "manifest.json");
+  let entry = JSON.parse(await readFile(manifestPath, "utf8")).images["src/images/sample.png"];
+  const variantPath = path.join(rootDir, ".imagedist", entry.variants[0].file);
+  const original = await readFile(variantPath);
+  const corrupted = Buffer.alloc(original.length, 0x42);
+  await writeFile(variantPath, corrupted);
+  const corruptedInfo = await stat(variantPath, { bigint: true });
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+  manifest.images["src/images/sample.png"].variants[0].size = Number(corruptedInfo.size);
+  manifest.images["src/images/sample.png"].variants[0].mtimeNs = corruptedInfo.mtimeNs.toString();
+  await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const statMode = await processImages(options);
+  assert.equal(statMode.processed, 0);
+  assert.equal(statMode.skipped, 1, "stat verification trusts the recorded size and mtime");
+
+  const digestMode = await processImages({ ...options, verification: "digest" });
+  assert.equal(digestMode.processed, 1);
+  entry = JSON.parse(await readFile(manifestPath, "utf8")).images["src/images/sample.png"];
+  assert.equal(createHash("sha256").update(await readFile(variantPath)).digest("hex"), entry.variants[0].digest);
+  assert.notDeepEqual(await readFile(variantPath), corrupted);
 });
 
 test("uses Sharp's default and configured WebP/AVIF efforts in encoders and transform identity", async (t) => {
@@ -324,7 +410,21 @@ test("adopts and reuses Sharp's one-pixel height rounding for JPEG resize", asyn
   assert.equal(warm.processed, 0);
   assert.equal(warm.skipped, 1);
   entry = JSON.parse(await readFile(packageManifestPath, "utf8")).images["src/images/sample.jpg"];
-  assert.deepEqual(entry.variants.map(({ width, height }) => [width, height]), [[256, 384], [828, 1243]]);
+  assert.deepEqual(
+    entry.variants.map(({ width, height }) => [width, height]),
+    [[256, 384], [828, 1242]],
+    "stat verification trusts the recorded tolerated height",
+  );
+
+  const digested = await processImages({ ...options, verification: "digest" });
+  assert.equal(digested.processed, 0);
+  assert.equal(digested.skipped, 1);
+  entry = JSON.parse(await readFile(packageManifestPath, "utf8")).images["src/images/sample.jpg"];
+  assert.deepEqual(
+    entry.variants.map(({ width, height }) => [width, height]),
+    [[256, 384], [828, 1243]],
+    "digest verification refreshes the recorded height from the output metadata",
+  );
 });
 
 test("SVG partial repair resets tolerated manifest height to the source height", async (t) => {
@@ -397,6 +497,34 @@ test("adopts matching existing variants, reuses them warm, and is idempotent", a
   const warm = await processImages(options);
   assert.equal(warm.processed, 0);
   assert.equal(warm.skipped, 1, "the adopted manifest and files should be a normal warm cache entry");
+});
+
+test("repeated adoption does not read legacy variants or copy existing targets", async (t) => {
+  const { rootDir, sourcePath } = await createProject();
+  t.after(() => rm(rootDir, { recursive: true, force: true }));
+  const { sourceHash, variants } = await createAdoptionFixtures(rootDir, sourcePath);
+  const options = adoptionOptions(rootDir);
+  const input = { sourcePath, sourceHash, variants };
+
+  const first = await adoptImageVariants(options, input);
+  assert.equal(first.adopted, 2);
+  const manifestBefore = await readFile(first.manifestPath, "utf8");
+  const entry = JSON.parse(manifestBefore).images["src/images/sample.png"];
+  const targetPaths = entry.variants.map(({ file }) => path.join(rootDir, ".imagedist", file));
+  const beforeStats = await Promise.all(targetPaths.map((filePath) => stat(filePath)));
+
+  await Promise.all(variants.map(({ path: variantPath }) => rm(variantPath)));
+  const second = await adoptImageVariants(options, input);
+  assert.equal(second.reused, 2);
+  assert.equal(await readFile(first.manifestPath, "utf8"), manifestBefore);
+  const afterStats = await Promise.all(targetPaths.map((filePath) => stat(filePath)));
+  assert.deepEqual(afterStats.map(({ mtimeMs }) => mtimeMs), beforeStats.map(({ mtimeMs }) => mtimeMs));
+
+  await assert.rejects(
+    adoptImageVariants({ ...options, verification: "digest" }, input),
+    { code: "ENOENT" },
+    "digest verification still requires and reads the supplied legacy variants",
+  );
 });
 
 test("rejects stale sources and incomplete variant sets without changing prior state", async (t) => {
@@ -593,6 +721,7 @@ test("rejects invalid encoder settings before touching output", async (t) => {
     [{ avifEffort: 10 }, /avifEffort must be between 0 and 9/],
     [{ avifEffort: 1.5 }, /avifEffort must be an integer between 0 and 9/],
     [{ avifEffort: null }, /avifEffort must be an integer between 0 and 9/],
+    [{ verification: "hash" }, /verification must be "stat" or "digest"/],
   ];
   for (const [invalid, message] of invalidEfforts) {
     await assert.rejects(processImages({ ...validOptions, ...invalid }), message);
