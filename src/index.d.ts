@@ -17,6 +17,12 @@ interface AstroImageCdnBaseOptions {
   webpEffort?: number;
   /** AVIF encoder effort, integer from 0 (fastest) to 9 (slowest). Defaults to Sharp's default, 4. */
   avifEffort?: number;
+  /**
+   * Warm-cache verification strategy. "stat" (default) trusts recorded file size and mtime,
+   * avoiding source/output reads when nothing changed. "digest" re-hashes every source and
+   * output on every run.
+   */
+  verification?: "stat" | "digest";
   /** Also generate a supported source-native format. Defaults to true. */
   includeSourceFormat?: boolean;
   /** Also generate the source's native width when it is not configured. Defaults to true. */
