@@ -63,6 +63,43 @@ export interface ProcessImagesResult {
   legacyPublicManifestPath?: string;
 }
 
+export interface PruneImagesOptions {
+  rootDir: string;
+  /** Directories that contain image sources; used only to reject unsafe overlaps. Defaults to ["src"]. */
+  sources?: string[];
+  /** Astro's public directory, relative to rootDir. Defaults to "public". */
+  publicDir?: string;
+  /**
+   * Persistent generated image directory, relative to rootDir. Defaults to ".imagedist".
+   * Must not equal or contain rootDir, and must not overlap publicDir, sources, or cacheDir.
+   */
+  outputDir?: string;
+  /** Incremental state directory, relative to rootDir. Defaults to ".astro-image-cdn". */
+  cacheDir?: string;
+  /** Report what would be removed without deleting anything. Defaults to false. */
+  dryRun?: boolean;
+  /** Also remove a legacy public manifest.json in outputDir. Defaults to false. */
+  removeLegacyPublicManifest?: boolean;
+}
+
+export interface PruneImagesResult {
+  /** Variant files deleted; in a dry run, files that would be deleted. */
+  removed: number;
+  /** Regular files and symlinks left in outputDir. The writer lock is not counted. */
+  kept: number;
+  /** Sum of the deleted files' sizes in bytes; in a dry run, bytes that would be freed. */
+  bytesFreed: number;
+  /** Empty directories removed; in a dry run, directories that would be removed. */
+  removedDirectories: number;
+  dryRun: boolean;
+  /** Private manifest that was used as the reference, inside cacheDir. */
+  manifestPath: string;
+  /** Legacy public manifest found in outputDir, if any. */
+  legacyPublicManifestPath?: string;
+  /** Whether the legacy public manifest was removed; in a dry run, whether it would be removed. */
+  legacyPublicManifestRemoved: boolean;
+}
+
 export interface AdoptImageVariant {
   /** Existing encoded output path; relative paths are resolved from rootDir. */
   path: string;
@@ -89,6 +126,7 @@ export interface AdoptImageVariantsResult {
 export default function astroImageCdn(options: AstroImageCdnOptions): AstroIntegration;
 
 export declare function processImages(options: ProcessImagesOptions): Promise<ProcessImagesResult>;
+export declare function pruneImages(options: PruneImagesOptions): Promise<PruneImagesResult>;
 export declare function adoptImageVariants(
   options: ProcessImagesOptions,
   input: AdoptImageVariantsInput,

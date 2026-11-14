@@ -97,7 +97,7 @@ Image identity is the project-relative file path; no frontmatter, YAML sidecars,
 - Each manifest is checked against the complete set of variants expected for its source and current options, so empty or partial entries trigger repair rather than a false cache hit.
 - The private cache and manifest are updated atomically and only when their contents change. Concurrent native image requests are deduplicated and batched per event-loop turn; batches are serialized through one writer queue, while the configured concurrency controls processing within each batch. A pre-existing `manifest.json` in `outputDir` is detected, reported in the processing result, and warned about when an Astro-requested image or standalone bulk run processes images; it is never modified. Verify its ownership, then manually move it outside public output or remove it before publishing. A filesystem lock allows only one process to write a given output/cache pair; overlapping processes fail with the lock path instead of racing. If a process is interrupted, verify it has stopped and remove any leftover `.astro-image-cdn.lock` file before retrying; the next run can rebuild missing variants.
 - Warm runs skip Sharp transformations when the fingerprint and every expected output still match. They also skip source reads when the recorded source stat still matches.
-- Old content-addressed files are intentionally retained. Request-driven Astro processing preserves unrelated manifest entries; an explicit standalone `processImages()` run reconciles the manifest with the files found under its source directories. Neither mode deletes historical output files.
+- Old content-addressed files are intentionally retained. Request-driven Astro processing preserves unrelated manifest entries; an explicit standalone `processImages()` run reconciles the manifest with the files found under its source directories. Neither mode deletes historical output files; use `pruneImages()` when reclaiming that space is intended.
 - Astro's `dist/` remains Astro-owned; this package does not copy into, clean, or deploy it.
 
 ### Adopting existing variants
@@ -130,6 +130,40 @@ await adoptImageVariants({
 
 The helper verifies the current source hash and each required output's actual format and dimensions before writing. It requires the complete variant set implied by the options; extras (such as legacy native-width files) are ignored. Outputs are atomically written under `outputDir`, and the private manifest/cache are updated only after validation. Under the default `verification: "stat"`, a repeated call whose targets and manifest already match returns without reading the supplied legacy files or copying bytes; `verification: "digest"` re-validates every supplied variant. Failures leave the prior manifest and existing outputs untouched, and old source variants are never removed. Supply the source hash recorded when the existing outputs were produced so a changed source cannot accidentally adopt stale files.
 
+### Pruning stale variants
+
+Because old variants are retained, `outputDir` keeps growing after style or pipeline changes. `pruneImages()` deletes files under `outputDir` that the private manifest does not reference and removes directories that become empty. It never reads, writes, or deletes sources, and it takes the same writer lock as `processImages()`/the integration, so it refuses to run while a build holds that lock.
+
+```js
+import { pruneImages } from "@all-the.rest/astro-image-cdn";
+
+const preview = await pruneImages({
+  rootDir: process.cwd(),
+  outputDir: ".imagedist",
+  cacheDir: ".astro-image-cdn",
+  dryRun: true,
+});
+console.log(preview);
+
+const result = await pruneImages({
+  rootDir: process.cwd(),
+  outputDir: ".imagedist",
+  cacheDir: ".astro-image-cdn",
+});
+```
+
+Pruning is intended for the point after a successful pipeline run or build has written the manifest and outputs that should be kept, and before publishing `outputDir`. Run it only when the private manifest is current: variants referenced by the manifest are always kept, so a stale manifest can keep stale variants, while a manifest from a different configuration cannot protect variants it does not know about. Start with `dryRun: true` to inspect the counts. The operation is not a substitute for running `processImages()` first.
+
+- The private manifest is mandatory and is the sole authority for what is kept. `pruneImages()` refuses to start when `cacheDir/manifest.json` is missing, malformed, or contains an entry whose variant file is missing, unsafe, symlinked, or outside `outputDir`; refusing is deliberate, so a bad manifest cannot cause an unbounded delete. Referenced variants are checked before anything is deleted.
+- An **empty manifest is not a no-op**: when `images` is `{}`, every file under `outputDir` is unreferenced and will be deleted. This can happen after `processImages()` ran against an empty source tree or a `sources` setting that contains no images. Confirm that is intended before pruning.
+- `outputDir` must be a dedicated variants directory. It must not equal or contain `rootDir`, and it must not overlap Astro's `publicDir`, any configured `sources` directory, or `cacheDir`. The `rootDir` check applies even when `sources: []`, so a misconfigured absolute `outputDir` cannot prune the project itself.
+- Only regular files under `outputDir` are deleted. Symlinks are never followed or unlinked, other special files are left untouched, and the writer lock file at the output root is ignored (a nested file with the same name is ordinary output). Kept files are never modified.
+- Empty directories below `outputDir` are removed; `outputDir` itself and `cacheDir` are kept.
+- A legacy public `manifest.json` in `outputDir` is reported in `legacyPublicManifestPath` and kept by default. Set `removeLegacyPublicManifest: true` to delete it (it is then included in `removed`/`bytesFreed`). Verify ownership before enabling this, as with the warning emitted during processing.
+- `removed` counts deleted variant files, `kept` counts regular files and symlinks left in `outputDir` (the writer lock is not counted), `bytesFreed` sums the deleted files' sizes, and `removedDirectories` counts removed empty directories. With `dryRun: true`, all four report what would happen while nothing is deleted; `legacyPublicManifestRemoved` then means it would be removed.
+
+The writer lock serializes this package's writers, not arbitrary processes. Pruning re-checks each directory and file immediately before descending or unlinking and never follows symlinks, but path-based filesystem APIs cannot make `outputDir` immutable. If another process concurrently renames or replaces entries inside `outputDir`, behavior is outside the guarantee. Run pruning as a build step on a quiescent output directory, or against a snapshot where external mutation cannot occur.
+
 ## API
 
 The default export is the Astro integration. Its image processor runs only when a native Astro image API requests an imported local image. The exported `processImages()` API is a separate, explicit bulk operation for standalone build scripts; calling it scans every supported image under `sources`:
@@ -147,6 +181,8 @@ console.log(result);
 ```
 
 The returned counts distinguish newly processed images from warm-cache reuses. `manifestPath` points into the configured private `cacheDir`; `legacyPublicManifestPath` is set when a pre-existing public manifest was found. This API only generates files and a manifest; it performs no deployment.
+
+The exported `pruneImages()` API complements `processImages()` by reclaiming space from variants the manifest no longer references (see [Pruning stale variants](#pruning-stale-variants)). It accepts the same directory options plus `dryRun` and `removeLegacyPublicManifest`, and returns `removed`, `kept`, `bytesFreed`, `removedDirectories`, `dryRun`, `manifestPath`, `legacyPublicManifestPath`, and `legacyPublicManifestRemoved`. It never deploys and never touches `dist/`.
 
 The standalone processor rejects `outputDir` or `cacheDir` inside Astro's `publicDir`, including symlink aliases. It assumes `rootDir/public` by default; pass `publicDir` when the Astro project customizes that directory. The integration supplies Astro's configured `publicDir` automatically.
 

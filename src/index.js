@@ -158,4 +158,4 @@ export default function astroImageCdn(options) {
   };
 }
 
-export { adoptImageVariants, processImages } from "./processor.js";
+export { adoptImageVariants, processImages, pruneImages } from "./processor.js";
