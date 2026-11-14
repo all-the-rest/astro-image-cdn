@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { open, readdir, readFile, realpath, rename, mkdir, lstat, unlink, writeFile } from "node:fs/promises";
+import { open, readdir, readFile, realpath, rename, mkdir, lstat, rmdir, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
 
@@ -59,6 +59,44 @@ async function canonicalizePath(value) {
       candidate = parent;
     }
   }
+}
+
+async function resolveCanonicalDirectories(options) {
+  const { rootDir, sourceDirectories, publicDir } = options;
+  const canonicalRoot = await canonicalizePath(rootDir);
+  const canonicalSources = [];
+  for (const sourceDirectory of sourceDirectories) {
+    const relative = path.relative(rootDir, sourceDirectory);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(`Image source directory must remain inside rootDir: ${sourceDirectory}`);
+    }
+    const canonicalSource = await canonicalizePath(sourceDirectory);
+    if (!isInside(canonicalRoot, canonicalSource)) {
+      throw new Error(`Image source directory must remain inside rootDir after resolving symlinks: ${sourceDirectory}`);
+    }
+    canonicalSources.push(canonicalSource);
+  }
+
+  const canonicalOutputDir = await canonicalizePath(options.outputDir);
+  const canonicalCacheDir = await canonicalizePath(options.cacheDir);
+  const canonicalPublicDir = await canonicalizePath(publicDir);
+  if (pathsOverlap(canonicalOutputDir, canonicalCacheDir)) {
+    throw new Error(`outputDir and cacheDir must not overlap: ${canonicalOutputDir} and ${canonicalCacheDir}`);
+  }
+  for (const [label, directory] of [["outputDir", canonicalOutputDir], ["cacheDir", canonicalCacheDir]]) {
+    if (isInside(canonicalPublicDir, directory)) {
+      throw new Error(`Image ${label} must be outside Astro's public directory, including through symlinks: ${directory}`);
+    }
+  }
+  for (const canonicalSource of canonicalSources) {
+    for (const [label, directory] of [["outputDir", canonicalOutputDir], ["cacheDir", canonicalCacheDir]]) {
+      if (pathsOverlap(canonicalSource, directory)) {
+        throw new Error(`Image ${label} must not overlap a scanned source directory, including through symlinks: ${directory}`);
+      }
+    }
+  }
+
+  return { canonicalRoot, canonicalSources, canonicalOutputDir, canonicalCacheDir, canonicalPublicDir };
 }
 
 async function releaseWriterLocks(locks) {
@@ -198,6 +236,25 @@ function resolveOptions(options) {
     includeNativeWidth,
     autoRotate,
   };
+}
+
+function resolvePruneOptions(options) {
+  if (!options || typeof options.rootDir !== "string") {
+    throw new TypeError("pruneImages requires an absolute rootDir");
+  }
+
+  const rootDir = path.resolve(options.rootDir);
+  const sourceDirectories = (options.sources ?? ["src"]).map((source) => path.resolve(rootDir, source));
+  const publicDir = path.resolve(rootDir, options.publicDir ?? "public");
+  const outputDir = path.resolve(rootDir, options.outputDir ?? ".imagedist");
+  const cacheDir = path.resolve(rootDir, options.cacheDir ?? ".astro-image-cdn");
+  const dryRun = options.dryRun ?? false;
+  const removeLegacyPublicManifest = options.removeLegacyPublicManifest ?? false;
+  for (const [label, value] of Object.entries({ dryRun, removeLegacyPublicManifest })) {
+    if (typeof value !== "boolean") throw new TypeError(`${label} must be a boolean`);
+  }
+
+  return { rootDir, sourceDirectories, publicDir, outputDir, cacheDir, dryRun, removeLegacyPublicManifest };
 }
 
 async function walk(directory, output, excludedPaths) {
@@ -567,41 +624,10 @@ async function mapConcurrent(items, concurrency, callback) {
 
 async function processImagesFromFiles(rawOptions, requestedFiles) {
   const options = resolveOptions(rawOptions);
-  const { rootDir, sourceDirectories, publicDir, concurrency, autoRotate, verification } = options;
+  const { rootDir, sourceDirectories, concurrency, autoRotate, verification } = options;
   let { outputDir, cacheDir } = options;
   const reportedManifestPath = path.join(cacheDir, "manifest.json");
-  const canonicalRoot = await canonicalizePath(rootDir);
-  const canonicalSources = [];
-  for (const sourceDirectory of sourceDirectories) {
-    const relative = path.relative(rootDir, sourceDirectory);
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      throw new Error(`Image source directory must remain inside rootDir: ${sourceDirectory}`);
-    }
-    const canonicalSource = await canonicalizePath(sourceDirectory);
-    if (!isInside(canonicalRoot, canonicalSource)) {
-      throw new Error(`Image source directory must remain inside rootDir after resolving symlinks: ${sourceDirectory}`);
-    }
-    canonicalSources.push(canonicalSource);
-  }
-
-  const canonicalOutputDir = await canonicalizePath(outputDir);
-  const canonicalCacheDir = await canonicalizePath(cacheDir);
-  const canonicalPublicDir = await canonicalizePath(publicDir);
-  if (pathsOverlap(canonicalOutputDir, canonicalCacheDir)) {
-    throw new Error(`outputDir and cacheDir must not overlap: ${canonicalOutputDir} and ${canonicalCacheDir}`);
-  }
-  for (const [label, directory] of [["outputDir", canonicalOutputDir], ["cacheDir", canonicalCacheDir]]) {
-    if (isInside(canonicalPublicDir, directory)) {
-      throw new Error(`Image ${label} must be outside Astro's public directory, including through symlinks: ${directory}`);
-    }
-  }
-  for (const canonicalSource of canonicalSources) {
-    for (const [label, directory] of [["outputDir", canonicalOutputDir], ["cacheDir", canonicalCacheDir]]) {
-      if (pathsOverlap(canonicalSource, directory)) {
-        throw new Error(`Image ${label} must not overlap a scanned source directory, including through symlinks: ${directory}`);
-      }
-    }
-  }
+  const { canonicalRoot, canonicalSources } = await resolveCanonicalDirectories(options);
 
   await mkdir(outputDir, { recursive: true });
   await mkdir(cacheDir, { recursive: true });
@@ -797,26 +823,14 @@ export async function adoptImageVariants(rawOptions, adoption) {
     throw new TypeError("adoptImageVariants requires a variants array");
   }
 
-  const { rootDir, sourceDirectories, publicDir, verification, autoRotate } = options;
+  const { rootDir, verification, autoRotate } = options;
   const sourcePath = path.resolve(rootDir, adoption.sourcePath);
   const relativePath = path.relative(rootDir, sourcePath);
   if (relativePath === ".." || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
     throw new Error(`Adopted source must remain inside rootDir: ${sourcePath}`);
   }
 
-  const canonicalRoot = await realpath(rootDir);
-  const canonicalSources = [];
-  for (const sourceDirectory of sourceDirectories) {
-    const relative = path.relative(rootDir, sourceDirectory);
-    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      throw new Error(`Image source directory must remain inside rootDir: ${sourceDirectory}`);
-    }
-    const canonicalSource = await canonicalizePath(sourceDirectory);
-    if (!isInside(canonicalRoot, canonicalSource)) {
-      throw new Error(`Image source directory must remain inside rootDir after resolving symlinks: ${sourceDirectory}`);
-    }
-    canonicalSources.push(canonicalSource);
-  }
+  const { canonicalRoot, canonicalSources } = await resolveCanonicalDirectories(options);
 
   const sourceInfo = await lstat(sourcePath);
   if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) {
@@ -825,21 +839,6 @@ export async function adoptImageVariants(rawOptions, adoption) {
   const canonicalSourcePath = await realpath(sourcePath);
   if (!isInside(canonicalRoot, canonicalSourcePath) || !canonicalSources.some((directory) => isInside(directory, canonicalSourcePath))) {
     throw new Error(`Adopted source must be inside one of the configured image source directories: ${sourcePath}`);
-  }
-
-  const canonicalOutputDir = await canonicalizePath(options.outputDir);
-  const canonicalCacheDir = await canonicalizePath(options.cacheDir);
-  const canonicalPublicDir = await canonicalizePath(publicDir);
-  if (pathsOverlap(canonicalOutputDir, canonicalCacheDir)) {
-    throw new Error(`outputDir and cacheDir must not overlap: ${canonicalOutputDir} and ${canonicalCacheDir}`);
-  }
-  for (const [label, directory] of [["outputDir", canonicalOutputDir], ["cacheDir", canonicalCacheDir]]) {
-    if (isInside(canonicalPublicDir, directory)) {
-      throw new Error(`Image ${label} must be outside Astro's public directory, including through symlinks: ${directory}`);
-    }
-    if (canonicalSources.some((sourceDirectory) => pathsOverlap(sourceDirectory, directory))) {
-      throw new Error(`Image ${label} must not overlap a scanned source directory, including through symlinks: ${directory}`);
-    }
   }
 
   for (const [index, variant] of adoption.variants.entries()) {
@@ -1065,6 +1064,205 @@ export async function processRequestedImages(rawOptions, requestedFiles) {
 /** Generate content-addressed variants for every image under the configured source directories. */
 export async function processImages(rawOptions) {
   return processImagesFromFiles(rawOptions, undefined);
+}
+
+async function readManifestForPrune(manifestPath) {
+  let contents;
+  try {
+    contents = await readFile(manifestPath, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      throw new Error(`Refusing to prune image variants: no manifest at ${manifestPath}. Run processImages() first.`, { cause: error });
+    }
+    throw new Error(`Could not read JSON file ${manifestPath}: ${error.message}`, { cause: error });
+  }
+
+  let manifest;
+  try {
+    manifest = JSON.parse(contents);
+  } catch (error) {
+    throw new Error(`Could not read JSON file ${manifestPath}: ${error.message}`, { cause: error });
+  }
+  if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
+    || !manifest.images || typeof manifest.images !== "object" || Array.isArray(manifest.images)) {
+    throw new Error(`Refusing to prune image variants: manifest ${manifestPath} has no images object.`);
+  }
+  return manifest;
+}
+
+function assertPruneDirectories(canonicalOutputDir, canonicalRoot, canonicalPublicDir) {
+  if (isInside(canonicalOutputDir, canonicalRoot)) {
+    throw new Error(`Refusing to prune image variants: outputDir must not equal or contain rootDir: ${canonicalOutputDir}`);
+  }
+  if (pathsOverlap(canonicalOutputDir, canonicalPublicDir)) {
+    throw new Error(`Refusing to prune image variants: outputDir must not overlap Astro's public directory: ${canonicalOutputDir}`);
+  }
+}
+
+function referencedOutputFiles(manifest, outputDir, manifestPath) {
+  const referenced = new Set();
+  for (const [source, entry] of Object.entries(manifest.images)) {
+    if (!entry || typeof entry !== "object" || !Array.isArray(entry.variants)) {
+      throw new Error(`Refusing to prune image variants: manifest ${manifestPath} has an unexpected entry for ${source}.`);
+    }
+    for (const variant of entry.variants) {
+      if (!variant || typeof variant.file !== "string" || variant.file === "") {
+        throw new Error(`Refusing to prune image variants: manifest ${manifestPath} has an invalid variant file for ${source}.`);
+      }
+      const filePath = path.resolve(outputDir, variant.file);
+      if (!isInside(outputDir, filePath) || filePath === outputDir) {
+        throw new Error(`Refusing to prune image variants: manifest ${manifestPath} references ${JSON.stringify(variant.file)} for ${source}, which is outside outputDir.`);
+      }
+      referenced.add(normalizeRelativePath(path.relative(outputDir, filePath)));
+    }
+  }
+  return referenced;
+}
+
+async function assertReferencedVariantsExist(outputDir, referenced, manifestPath) {
+  for (const file of referenced) {
+    if (!(await inspectVariantFile(outputDir, file))) {
+      throw new Error(`Refusing to prune image variants: manifest ${manifestPath} references missing or unsafe file ${file}. Run processImages() first.`);
+    }
+  }
+}
+
+async function pruneOutputDirectory(outputDir, referenced, options) {
+  const lockPath = path.join(outputDir, ".astro-image-cdn.lock");
+  const legacyManifestPath = path.join(outputDir, "manifest.json");
+  let removed = 0;
+  let kept = 0;
+  let bytesFreed = 0;
+  const removableDirectories = [];
+
+  async function visit(directory) {
+    let entries;
+    try {
+      if (directory !== outputDir) {
+        // Defense in depth against a directory being replaced by a symlink: never descend through it.
+        const info = await lstat(directory);
+        if (!info.isDirectory() || info.isSymbolicLink()) return true;
+      }
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+
+    let retained = 0;
+    for (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entryPath === lockPath) {
+        // The writer lock is ours and still held; it is not part of the output inventory.
+        retained++;
+        continue;
+      }
+      if (entryPath === legacyManifestPath) {
+        // Handled separately so it can be kept or explicitly removed, even when it is a symlink.
+        if (!options.removeLegacyPublicManifest) kept++;
+        retained++;
+        continue;
+      }
+      if (entry.isDirectory()) {
+        if (await visit(entryPath)) retained++;
+        else removableDirectories.push(entryPath);
+        continue;
+      }
+      // Symlinks and special files are never followed, unlinked, or counted as freed bytes.
+      if (!entry.isFile()) {
+        kept++;
+        retained++;
+        continue;
+      }
+
+      const relative = normalizeRelativePath(path.relative(outputDir, entryPath));
+      if (referenced.has(relative)) {
+        kept++;
+        retained++;
+        continue;
+      }
+
+      const info = await lstat(entryPath);
+      if (!info.isFile() || info.isSymbolicLink()) {
+        kept++;
+        retained++;
+        continue;
+      }
+      if (!options.dryRun) await unlink(entryPath);
+      removed++;
+      bytesFreed += info.size;
+    }
+    return retained > 0;
+  }
+
+  await visit(outputDir);
+
+  let removedDirectories = 0;
+  for (const directory of removableDirectories) {
+    if (options.dryRun) {
+      removedDirectories++;
+      continue;
+    }
+    try {
+      await rmdir(directory);
+      removedDirectories++;
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY") throw error;
+    }
+  }
+
+  return { removed, kept, bytesFreed, removedDirectories };
+}
+
+/**
+ * Delete generated variants under outputDir that the private manifest no longer references.
+ * Never follows symlinks, never touches sources, and runs under the writer lock.
+ */
+export async function pruneImages(rawOptions) {
+  const options = resolvePruneOptions(rawOptions);
+  const manifestPath = path.join(options.cacheDir, "manifest.json");
+  const { canonicalRoot, canonicalOutputDir, canonicalPublicDir } = await resolveCanonicalDirectories(options);
+  assertPruneDirectories(canonicalOutputDir, canonicalRoot, canonicalPublicDir);
+
+  await mkdir(options.outputDir, { recursive: true });
+  await mkdir(options.cacheDir, { recursive: true });
+  const outputDir = await realpath(options.outputDir);
+  const cacheDir = await realpath(options.cacheDir);
+  const releaseLocks = await acquireWriterLocks([outputDir, cacheDir]);
+  try {
+    const lockedManifestPath = path.join(cacheDir, "manifest.json");
+    const manifest = await readManifestForPrune(lockedManifestPath);
+    const referenced = referencedOutputFiles(manifest, outputDir, lockedManifestPath);
+    await assertReferencedVariantsExist(outputDir, referenced, lockedManifestPath);
+    const legacyPublicManifestPath = await detectLegacyPublicManifest(outputDir);
+    const legacyInfo = legacyPublicManifestPath ? await lstat(legacyPublicManifestPath) : undefined;
+    if (legacyInfo && options.removeLegacyPublicManifest && !legacyInfo.isFile() && !legacyInfo.isSymbolicLink()) {
+      throw new Error(`Refusing to prune image variants: legacy manifest path ${legacyPublicManifestPath} is not a file.`);
+    }
+    const stats = await pruneOutputDirectory(outputDir, referenced, options);
+
+    let { removed, kept, bytesFreed } = stats;
+    let legacyPublicManifestRemoved = false;
+    if (legacyInfo && options.removeLegacyPublicManifest) {
+      if (legacyInfo.isFile() && !legacyInfo.isSymbolicLink()) bytesFreed += legacyInfo.size;
+      if (!options.dryRun) await unlink(legacyPublicManifestPath);
+      removed++;
+      legacyPublicManifestRemoved = true;
+    }
+
+    return {
+      removed,
+      kept,
+      bytesFreed,
+      removedDirectories: stats.removedDirectories,
+      dryRun: options.dryRun,
+      manifestPath,
+      legacyPublicManifestPath,
+      legacyPublicManifestRemoved,
+    };
+  } finally {
+    await releaseLocks();
+  }
 }
 
 export const DEFAULT_IMAGE_WIDTHS = DEFAULT_WIDTHS;
