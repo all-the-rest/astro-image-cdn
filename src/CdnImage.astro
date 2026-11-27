@@ -1,0 +1,37 @@
+---
+import { getImage, imageConfig } from "astro:assets";
+
+export interface Props {
+  src: import("astro").ImageMetadata;
+  alt: string;
+  sizes?: string;
+}
+
+const config = imageConfig.service.config;
+if (!config || typeof config.rootDir !== "string") {
+  throw new Error("CdnImage requires the astroImageCdn integration to be enabled in the Astro config.");
+}
+
+const { src, alt, sizes } = Astro.props;
+if (alt === undefined || alt === null) {
+  throw new TypeError("CdnImage requires an alt attribute.");
+}
+
+const formats = config.formats;
+if (!Array.isArray(formats) || formats.length === 0) {
+  throw new Error("CdnImage requires at least one configured format from the astroImageCdn integration.");
+}
+
+const base = { src, alt, widths: config.widths, ...(sizes ? { sizes } : {}) };
+const optimized = await Promise.all(
+  formats.map((format) => getImage({ ...base, format, layout: "none" })),
+);
+const fallback = optimized.at(-1);
+---
+
+<picture>
+  {optimized.map((img, i) => (
+    <source srcset={img.srcSet.attribute || img.src} type={`image/${img.options.format ?? formats[i]}`} {...(sizes ? { sizes } : {})} />
+  ))}
+  <img src={fallback.src} {...(fallback.srcSet.attribute ? { srcset: fallback.srcSet.attribute } : {})} {...fallback.attributes} />
+</picture>

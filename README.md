@@ -47,6 +47,21 @@ const socialImage = await getImage({ src: photo, width: 1200, format: "webp" });
 
 In production builds, `Image`, `Picture`, and `getImage()` generate absolute URLs under `baseUrl`. In `astro dev`, requested variants are served directly from `outputDir` at `/_astro-image-cdn/`; the URL is local and does not require a CDN upload. The integration does not upload assets, configure a CDN, deploy, or modify hosting configuration. Production output must be made available at the corresponding `baseUrl` by the site's separate publishing process.
 
+### Optional `CdnImage` component
+
+Native `<Picture>` remains the default and is the best choice when you want Astro's responsive layout/style features and per-image control. For sites rendering images by slug/content, or that want CDN-correct markup without maintaining their own glue, the package also exports an opt-in component:
+
+```astro
+---
+import CdnImage from "@all-the.rest/astro-image-cdn/CdnImage";
+import photo from "../assets/photo.jpg";
+---
+
+<CdnImage src={photo} alt="A landscape" sizes="(max-width: 600px) 100vw, 50vw" />
+```
+
+Its entire prop surface is `src` (an imported local image via Astro assets), `alt`, and optional `sizes`; there are no per-image width, format, quality, effort, or `baseUrl` props. Widths, formats and their order, quality, encoder efforts, `baseUrl`, and the dev/build URL mapping all come from the integration configuration. The component emits no styles and renders only `<picture>` with one `<source>` per configured format (AVIF then WebP by default) followed by an `<img>` fallback in the last configured format. Project-relative string paths are not supported because Astro's public image APIs require imports; import the image instead. The integration must be active (not `devOnly` during a build).
+
 For a locally linked package that should affect development only, set `devOnly: true`:
 
 ```js
