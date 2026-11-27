@@ -5,6 +5,7 @@ import astroImageCdn, {
   pruneImages,
   type PruneImagesResult,
 } from "../src/index.js";
+import CdnImage, { type CdnImageProps } from "../src/cdn-image.js";
 
 const options: AstroImageCdnOptions = {
   baseUrl: "https://images.example.com/site",
@@ -42,6 +43,9 @@ const pruning: Promise<PruneImagesResult> = pruneImages({
 });
 const legacyPublicManifestPath: Promise<string | undefined> = processing.then((result) => result.legacyPublicManifestPath);
 const prunedFiles: Promise<number> = pruning.then((result) => result.removed);
+const cdnProps: CdnImageProps = { src: {} as never, alt: "x", sizes: "100vw" };
+void CdnImage;
+void cdnProps;
 void integration;
 void localDevIntegration;
 void processing;

@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/index.d.ts", "tests/types.ts"]
+  "include": ["src/index.d.ts", "src/cdn-image.d.ts", "tests/types.ts"]
 }
