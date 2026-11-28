@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,7 +7,9 @@ import sharp from "sharp";
 import { processImages, pruneImages } from "../src/processor.js";
 
 async function createProject() {
-  const rootDir = await mkdtemp(path.join(os.tmpdir(), "astro-image-cdn-prune-"));
+  // mkdtemp returns the /var path while the library reports the canonical
+  // /private/var path (it calls realpath), so canonicalize the temp root here.
+  const rootDir = await realpath(await mkdtemp(path.join(os.tmpdir(), "astro-image-cdn-prune-")));
   const sourceDir = path.join(rootDir, "src", "images");
   await mkdir(sourceDir, { recursive: true });
   const sourcePath = path.join(sourceDir, "sample.png");

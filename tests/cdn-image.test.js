@@ -12,6 +12,28 @@ const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 const integrationEntrypoint = pathToFileURL(path.join(packageRoot, "src", "index.js")).href;
 const componentEntrypoint = pathToFileURL(path.join(packageRoot, "src", "CdnImage.astro")).href;
 
+// Astro's getOutDirWithinCwd() falls back to <cwd>/.astro for its intermediate
+// SSR build output whenever the build root lies outside process.cwd(). Test files
+// run in parallel processes, so builds from os.tmpdir() would otherwise share
+// that directory and race on its prerender files. Building with the project as
+// cwd keeps each build's intermediate output isolated.
+function viteCacheDir(rootDir) {
+  // Test projects symlink the package's node_modules, so Vite's default
+  // <root>/node_modules/.vite would be one shared directory for every parallel
+  // test project. Point it at the project itself instead.
+  return path.join(rootDir, ".vite-cache");
+}
+
+async function buildProject(rootDir) {
+  const previousCwd = process.cwd();
+  process.chdir(rootDir);
+  try {
+    return await build({ root: rootDir, logLevel: "silent", vite: { cacheDir: viteCacheDir(rootDir) } });
+  } finally {
+    process.chdir(previousCwd);
+  }
+}
+
 async function createProject(t, { width = 840, height = 560 } = {}) {
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "astro-image-cdn-cdn-image-"));
   t.after(() => rm(rootDir, { recursive: true, force: true }));
@@ -70,7 +92,7 @@ test("CdnImage renders config-ordered picture markup in a real build", async (t)
     includeSourceFormat: false,
   });
   await writePage(rootDir);
-  await build({ root: rootDir, logLevel: "silent" });
+  await buildProject(rootDir);
 
   const html = await readFile(path.join(rootDir, "dist", "index.html"), "utf8");
   const { picture, tags, sources, img } = readPicture(html);
@@ -118,7 +140,7 @@ test("CdnImage follows changed integration config without prop changes", async (
     includeSourceFormat: false,
   });
   await writePage(rootDir);
-  await build({ root: rootDir, logLevel: "silent" });
+  await buildProject(rootDir);
 
   const html = await readFile(path.join(rootDir, "dist", "index.html"), "utf8");
   const { tags, sources, img } = readPicture(html);
@@ -140,7 +162,7 @@ test("CdnImage emits a single native-width candidate for a narrow source", async
     formats: ["avif", "webp"],
   });
   await writePage(rootDir);
-  await build({ root: rootDir, logLevel: "silent" });
+  await buildProject(rootDir);
 
   const html = await readFile(path.join(rootDir, "dist", "index.html"), "utf8");
   const { sources, img } = readPicture(html);
@@ -169,9 +191,14 @@ test("CdnImage uses local dev URLs and writes a private manifest in astro dev", 
   await writeConfig(rootDir, { baseUrl: "https://cdn.example.test", widths: [48], formats: ["avif", "webp"] });
   await writePage(rootDir);
 
+  // The project files were just written; fsevents can deliver their change
+  // events after the dev server has started, which makes Astro restart in place
+  // and drops the first request mid-flight. Let the filesystem settle first.
+  await new Promise((resolve) => setTimeout(resolve, 500));
   server = await dev({
     root: rootDir,
     logLevel: "silent",
+    vite: { cacheDir: viteCacheDir(rootDir) },
     server: { host: "127.0.0.1", port: 0, strictPort: true },
   });
   const pageUrl = `http://127.0.0.1:${server.address.port}/`;
@@ -230,7 +257,7 @@ test("CdnImage forwards presentation attributes to the img only", async (t) => {
     'quality="10"',
     'baseUrl="https://evil.test"',
   ].join(" "));
-  await build({ root: rootDir, logLevel: "silent" });
+  await buildProject(rootDir);
 
   const html = await readFile(path.join(rootDir, "dist", "index.html"), "utf8");
   const { picture, sources, img } = readPicture(html);

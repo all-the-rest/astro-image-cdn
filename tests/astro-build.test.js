@@ -11,6 +11,28 @@ import astroImageCdn from "../src/index.js";
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const integrationEntrypoint = pathToFileURL(path.join(packageRoot, "src", "index.js")).href;
 
+// Astro's getOutDirWithinCwd() falls back to <cwd>/.astro for its intermediate
+// SSR build output whenever the build root lies outside process.cwd(). Test files
+// run in parallel processes, so builds from os.tmpdir() would otherwise share
+// that directory and race on its prerender files. Building with the project as
+// cwd keeps each build's intermediate output isolated.
+function viteCacheDir(rootDir) {
+  // Test projects symlink the package's node_modules, so Vite's default
+  // <root>/node_modules/.vite would be one shared directory for every parallel
+  // test project. Point it at the project itself instead.
+  return path.join(rootDir, ".vite-cache");
+}
+
+async function buildProject(rootDir) {
+  const previousCwd = process.cwd();
+  process.chdir(rootDir);
+  try {
+    return await build({ root: rootDir, logLevel: "silent", vite: { cacheDir: viteCacheDir(rootDir) } });
+  } finally {
+    process.chdir(previousCwd);
+  }
+}
+
 test("rejects CDN base URLs containing credentials without echoing them", () => {
   for (const baseUrl of [
     "https://user:secret@cdn.example.test/images",
@@ -110,7 +132,7 @@ test("Astro Image, Picture, and getImage build to external variants and warm wit
     </body></html>
   `);
 
-  const runBuild = () => build({ root: rootDir, logLevel: "silent" });
+  const runBuild = () => buildProject(rootDir);
   await runBuild();
 
   const outputDir = path.join(rootDir, ".imagedist");
@@ -208,14 +230,19 @@ test("devOnly leaves build configuration and processing untouched, then serves r
     <Image src={requested} width={48} format="webp" alt="Requested image" />
   `);
 
-  await build({ root: rootDir, logLevel: "silent" });
+  await buildProject(rootDir);
   await assert.rejects(stat(path.join(rootDir, ".imagedist")), { code: "ENOENT" });
   await assert.rejects(stat(path.join(rootDir, ".astro-image-cdn")), { code: "ENOENT" });
   assert.match(await readFile(path.join(rootDir, "dist", "index.html"), "utf8"), /<img[^>]+src="\/_astro\//);
 
+  // Files written just before startup can surface as late watcher events, which
+  // makes Astro restart in place and drops the first request mid-flight. Let the
+  // filesystem settle before starting the dev server.
+  await new Promise((resolve) => setTimeout(resolve, 500));
   server = await dev({
     root: rootDir,
     logLevel: "silent",
+    vite: { cacheDir: viteCacheDir(rootDir) },
     server: { host: "127.0.0.1", port: 0, strictPort: true },
   });
   const address = server.address;
@@ -264,7 +291,7 @@ test("respects Astro image.dangerouslyProcessSVG for imported SVGs", async (t) =
       <Image id="svg-image" src={icon} ${dangerouslyProcessSVG ? 'format="webp"' : ""} alt="Icon" />
     `);
 
-    await build({ root: rootDir, logLevel: "silent" });
+    await buildProject(rootDir);
     const manifest = JSON.parse(await readFile(path.join(rootDir, ".astro-image-cdn", "manifest.json"), "utf8"));
     await assert.rejects(stat(path.join(rootDir, ".imagedist", "manifest.json")), { code: "ENOENT" });
     const variants = manifest.images["src/assets/icon.svg"].variants;
@@ -299,7 +326,7 @@ test("fails configuration when persistent output or cache is inside Astro public
       import astroImageCdn from ${JSON.stringify(integrationEntrypoint)};
       export default { publicDir: "./public", integrations: [astroImageCdn(${JSON.stringify(integrationOptions)})] };
     `);
-    await assert.rejects(build({ root: rootDir, logLevel: "silent" }), error);
+    await assert.rejects(buildProject(rootDir), error);
   }
 });
 
@@ -353,7 +380,7 @@ test("real Astro builds reject invalid encoder effort before changing output or 
       <Image src={sample} width={48} format="webp" alt="sample" />
     `);
 
-    await assert.rejects(build({ root: rootDir, logLevel: "silent" }), invalid.message);
+    await assert.rejects(buildProject(rootDir), invalid.message);
     assert.deepEqual((await readdir(outputDir)).sort(), outputEntriesBefore.sort());
     assert.deepEqual((await readdir(cacheDir)).sort(), cacheEntriesBefore.sort());
     assert.equal(await readFile(path.join(outputDir, "sentinel.txt"), "utf8"), outputSentinel);
