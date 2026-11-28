@@ -35,13 +35,13 @@ async function writeConfig(rootDir, options) {
   `);
 }
 
-async function writePage(rootDir) {
+async function writePage(rootDir, imgAttributes = "") {
   await writeFile(path.join(rootDir, "src", "pages", "index.astro"), `
     ---
     import CdnImage from ${JSON.stringify(componentEntrypoint)};
     import sample from "../assets/sample.png";
     ---
-    <CdnImage src={sample} alt="A landscape" sizes="(max-width: 600px) 100vw, 50vw" />
+    <CdnImage src={sample} alt="A landscape" sizes="(max-width: 600px) 100vw, 50vw" ${imgAttributes} />
   `);
 }
 
@@ -204,16 +204,87 @@ test("CdnImage uses local dev URLs and writes a private manifest in astro dev", 
   assert.ok(manifest.images["src/assets/sample.png"]);
 });
 
-test("CdnImage export surface exposes only the documented props", async () => {
+test("CdnImage forwards presentation attributes to the img only", async (t) => {
+  const { rootDir } = await createProject(t);
+  await writeConfig(rootDir, {
+    baseUrl: "https://cdn.example.test/photos",
+    widths: [256],
+    formats: ["avif", "webp"],
+    includeSourceFormat: false,
+  });
+  await writePage(rootDir, [
+    'pictureClass="contents"',
+    'class="w-full"',
+    'loading="eager"',
+    'decoding="sync"',
+    'fetchpriority="high"',
+    'data-pswp-width="840"',
+    'data-pswp-height="560"',
+    'aria-label="Testbild"',
+    'title="Hinweis"',
+    'width="1"',
+    'srcSet="/camel.webp 1w"',
+    'style="color:red"',
+    'widths="1,2"',
+    'formats="png"',
+    'quality="10"',
+    'baseUrl="https://evil.test"',
+  ].join(" "));
+  await build({ root: rootDir, logLevel: "silent" });
+
+  const html = await readFile(path.join(rootDir, "dist", "index.html"), "utf8");
+  const { picture, sources, img } = readPicture(html);
+  const pictureTag = picture.match(/^<picture\b[^>]*>/)?.[0];
+  assert.ok(pictureTag, "expected an opening <picture> tag");
+  assert.equal(attr(pictureTag, "class"), "contents");
+  assert.equal(attr(img, "class"), "w-full");
+  assert.equal(attr(img, "loading"), "eager");
+  assert.equal(attr(img, "decoding"), "sync");
+  assert.equal(attr(img, "fetchpriority"), "high");
+  assert.equal(attr(img, "data-pswp-width"), "840");
+  assert.equal(attr(img, "data-pswp-height"), "560");
+  assert.equal(attr(img, "aria-label"), "Testbild");
+  // Unknown props are forwarded as plain HTML attributes.
+  assert.equal(attr(img, "title"), "Hinweis");
+  // A caller-supplied pipeline attribute is dropped; the pipeline value wins.
+  const widthAttributes = img.match(/\swidth="/g) ?? [];
+  assert.equal(widthAttributes.length, 1, "the img must carry exactly one width attribute");
+  assert.equal(img.match(/\swidth="([^"]*)"/)?.[1], "840");
+  assert.equal(/width="1"/.test(img), false, "the caller width must not survive");
+  // A camelCase `srcSet` must not add a second srcset next to the pipeline's own.
+  assert.equal((img.match(/\ssrcset="/gi) ?? []).length, 1, "the img must carry exactly one srcset attribute");
+  assert.equal(/\/camel\.webp/.test(img), false, "the caller srcSet must not survive");
+  // Pipeline prop names are ignored even though the index signature accepts them.
+  for (const name of ["widths", "formats", "quality", "baseUrl"]) {
+    assert.equal(new RegExp(`\\s${name}="`).test(img), false, `${name} must not reach the img`);
+  }
+  // The wrapper keeps only its own class; presentation attributes stay on the <img>.
+  assert.equal(pictureTag, '<picture class="contents">');
+  // The wrapper class is not a presentation attribute of the <img>.
+  assert.equal(attr(img, "pictureClass"), undefined);
+  assert.equal(/pictureclass=/i.test(img), false, "pictureClass must only reach the picture wrapper");
+  for (const tag of sources) {
+    assert.equal(/\b(class|loading|data-pswp-width|aria-label)=/.test(tag), false, tag);
+  }
+  assert.equal(/\bstyle=/.test(picture), false, "no inline styles should be emitted");
+});
+
+test("CdnImage export surface builds on Astro's img attributes and no pipeline props", async () => {
   const pkg = JSON.parse(await readFile(path.join(packageRoot, "package.json"), "utf8"));
   assert.deepEqual(pkg.exports["./CdnImage"], {
     types: "./src/cdn-image.d.ts",
     import: "./src/CdnImage.astro",
   });
-  assert.equal(pkg.version, "0.5.0");
+  assert.equal(pkg.version, "0.5.1");
 
   const source = await readFile(path.join(packageRoot, "src", "CdnImage.astro"), "utf8");
-  const props = source.match(/export interface Props \{([\s\S]*?)\}/)?.[1];
-  assert.ok(props, "expected an exported Props interface");
-  assert.deepEqual([...props.matchAll(/^\s*(\w+)\??:/gm)].map((match) => match[1]), ["src", "alt", "sizes"]);
+  const types = await readFile(path.join(packageRoot, "src", "cdn-image.d.ts"), "utf8");
+  for (const [label, text] of [["component", source], ["types", types]]) {
+    assert.match(text, /Omit<\s*HTMLAttributes<"img">,\s*"src" \| "srcset" \| "width" \| "height" \| "style"\s*>/, `${label} must omit the pipeline attributes`);
+    assert.match(text, /\[key: string\]: unknown/, `${label} must allow unknown props`);
+  }
+  for (const pipelineProp of ["widths", "formats", "quality", "webpEffort", "avifEffort", "baseUrl"]) {
+    assert.equal(new RegExp(`^\\s*${pipelineProp}\\??:`, "m").test(source), false, `${pipelineProp} must come from config`);
+    assert.equal(new RegExp(`^\\s*${pipelineProp}\\??:`, "m").test(types), false, `${pipelineProp} must come from config`);
+  }
 });

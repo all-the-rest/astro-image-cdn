@@ -1,18 +1,30 @@
 ---
 import { getImage, imageConfig } from "astro:assets";
+import type { HTMLAttributes } from "astro/types";
 
-export interface Props {
+/** Official <img> attributes minus the pipeline-derived ones. */
+export type Props = Omit<
+  HTMLAttributes<"img">,
+  "src" | "srcset" | "width" | "height" | "style"
+> & {
+  /** Imported local image (Astro ImageMetadata). */
   src: import("astro").ImageMetadata;
+  /** Alternative text. */
   alt: string;
+  /** Optional HTML sizes hint; forwarded to <source> and <img>. */
   sizes?: string;
-}
+  /** Optional class for the <picture> wrapper (layout only). */
+  pictureClass?: string;
+  /** Any other prop is forwarded as an HTML attribute to the <img>. */
+  [key: string]: unknown;
+};
 
 const config = imageConfig.service.config;
 if (!config || typeof config.rootDir !== "string") {
   throw new Error("CdnImage requires the astroImageCdn integration to be enabled in the Astro config.");
 }
 
-const { src, alt, sizes } = Astro.props;
+const { src, alt, sizes, pictureClass, ...forwarded } = Astro.props;
 if (alt === undefined || alt === null) {
   throw new TypeError("CdnImage requires an alt attribute.");
 }
@@ -27,11 +39,25 @@ const optimized = await Promise.all(
   formats.map((format) => getImage({ ...base, format, layout: "none" })),
 );
 const fallback = optimized.at(-1);
+
+// Merge into one object: spreading twice would emit duplicate HTML attributes,
+// and browsers use the first value instead of the caller's override.
+const imgAttributes: Record<string, unknown> = { ...fallback.attributes };
+// Pipeline-derived attributes, component-only props and pipeline prop names never
+// reach the <img>. Keys are compared lowercased so camelCase variants such as
+// `srcSet` cannot add a second attribute next to the pipeline's own.
+const reservedAttributes = new Set([
+  "src", "srcset", "width", "height", "style", "alt", "sizes", "pictureclass", "classlist",
+  "widths", "formats", "quality", "webpeffort", "avifeffort", "baseurl",
+]);
+for (const [key, value] of Object.entries(forwarded)) {
+  if (!reservedAttributes.has(key.toLowerCase())) imgAttributes[key] = value;
+}
 ---
 
-<picture>
+<picture {...(pictureClass ? { class: pictureClass } : {})}>
   {optimized.map((img, i) => (
     <source srcset={img.srcSet.attribute || img.src} type={`image/${img.options.format ?? formats[i]}`} {...(sizes ? { sizes } : {})} />
   ))}
-  <img src={fallback.src} {...(fallback.srcSet.attribute ? { srcset: fallback.srcSet.attribute } : {})} {...fallback.attributes} />
+  <img src={fallback.src} {...(fallback.srcSet.attribute ? { srcset: fallback.srcSet.attribute } : {})} {...imgAttributes} />
 </picture>

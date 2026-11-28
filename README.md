@@ -60,7 +60,14 @@ import photo from "../assets/photo.jpg";
 <CdnImage src={photo} alt="A landscape" sizes="(max-width: 600px) 100vw, 50vw" />
 ```
 
-Its entire prop surface is `src` (an imported local image via Astro assets), `alt`, and optional `sizes`; there are no per-image width, format, quality, effort, or `baseUrl` props. Widths, formats and their order, quality, encoder efforts, `baseUrl`, and the dev/build URL mapping all come from the integration configuration. The component emits no styles and renders only `<picture>` with one `<source>` per configured format (AVIF then WebP by default) followed by an `<img>` fallback in the last configured format. Project-relative string paths are not supported because Astro's public image APIs require imports; import the image instead. The integration must be active (not `devOnly` during a build).
+Its props are `src` (an imported local image via Astro assets), `alt`, optional `sizes`, optional `pictureClass`, and the official `<img>` attributes typed via Astro's `HTMLAttributes<"img">`. Those attributes — `class`, `loading`, `decoding`, `fetchpriority`, `title`, `data-*`, `aria-*` — and any other unknown prop are forwarded to the rendered `<img>` only, while `pictureClass` goes to the `<picture>` wrapper — for example `class="contents"` so a grid or overlay layout can position the wrapper. `src`, `srcset`, `width`, `height` and inline `style` stay reserved for the pipeline, and the component props `alt`, `sizes` and `pictureClass` are never forwarded from the caller. This lets a site-specific wrapper pass layout classes or lightbox/EXIF metadata without reimplementing the responsive markup:
+
+```astro
+<CdnImage src={photo} alt="A landscape" sizes="100vw" pictureClass="contents" class="w-full"
+  loading="eager" data-pswp-width={1200} data-pswp-height={800} />
+```
+
+There are no per-image width, format, quality, effort, or `baseUrl` props. Widths, formats and their order, quality, encoder efforts, `baseUrl`, and the dev/build URL mapping all come from the integration configuration. Pipeline prop names (`widths`, `formats`, `quality`, `webpEffort`, `avifEffort`, `baseUrl`) and the reserved attributes `src`, `srcSet`, `width`, `height`, `style`, `alt`, `sizes` and `pictureClass` are ignored when a caller passes them — case-insensitively — even though the component's `[key: string]: unknown` index signature accepts them at the type level. The component emits no styles and renders only `<picture>` with one `<source>` per configured format (AVIF then WebP by default) followed by an `<img>` fallback in the last configured format. Project-relative string paths are not supported because Astro's public image APIs require imports; import the image instead. The integration must be active (not `devOnly` during a build).
 
 For a locally linked package that should affect development only, set `devOnly: true`:
 
